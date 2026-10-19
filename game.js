@@ -1213,7 +1213,9 @@ function updateLobby() {
 function update(dt) {
   if (state === 'menu') return;
   // Cliente: medir el ping con el host cada segundo
-  if (Net.role === 'client' && (NET.pingT -= dt) <= 0) { NET.pingT = 1; Net.send({ t: 'ping', c: performance.now() }); }
+  if (Net.role === 'client' && (NET.pingT -= dt) <= 0) { NET.pingT = 1; Net.sendFast({ t: 'ping', c: performance.now() }); }
+  // Cada 2 s: ¿la conexión es directa o pasa por un servidor intermedio (relay)?
+  if (Net.role !== 'local' && (NET.routeT -= dt) <= 0) { NET.routeT = 2; checkRoutes(); }
   if (state === 'lobby') { updateLobby(); return; }
   if (Net.role !== 'client' && anyPressed(['Escape'])) { toLobby(); return; }
   if (!G) return;
@@ -1375,7 +1377,10 @@ function cosmetics(dt) {
 //  - Los clientes envían sus controles y pulsaciones de ACCIÓN, y dibujan el
 //    estado suavizado. El parry lo juzga la pantalla de quien lo pulsa.
 // ---------------------------------------------------------------------
-const NET = { inputs: {}, acts: {}, queue: [], sendT: 0, lastInp: '', pingT: 0, rtt: 0, localBumps: [] };
+const NET = {
+  inputs: {}, acts: {}, queue: [], sendT: 0, lastInp: '', pingT: 0, rtt: 0, localBumps: [],
+  seq: 0, frame: 0, lastSeq: 0, inSeq: 0, inSeqs: {}, routes: {}, routeT: 0,
+};
 const PREDICT_SNAP = 160;  // si la predicción se aleja más que esto del host, se corrige de golpe
 const PREDICT_PULL = 4;    // fuerza de la corrección suave hacia el host (más alto = más rígido)
 const SNAP_DELAY = 0.025;  // retraso extra del estado del host además del ping (su fotograma + envío)
@@ -1508,9 +1513,10 @@ function sendLobby() {
   });
 }
 
-function makeSnap() {
-  return {
-    t: 's', st: state, cd: countdown, ot: overT, seed: G.seed, time: G.time,
+// full: incluye puertas y cuerdas (cambian poco). Los carros van en todos.
+function makeSnap(full) {
+  const snap = {
+    t: 's', seq: ++NET.seq, st: state, cd: countdown, ot: overT, seed: G.seed, time: G.time,
     doomY: r1(G.doomY), ds: G.doomSpeed, best: G.best, tm: G.team, tb: G.turbo,
     cars: G.cars.map((c) => ({
       id: c.id, x: r1(c.x), y: r1(c.y), a: Math.round(c.a * 1000) / 1000, vx: r1(c.vx), vy: r1(c.vy),
@@ -1519,25 +1525,27 @@ function makeSnap() {
       dr: c.drift, sl: Math.round(c.slip * 100) / 100, sc: c.score, ne: c.noEngine,
       cb: c.combo ? { pts: Math.round(c.combo.pts), mult: c.combo.mult, idle: r1(c.combo.idle) } : null,
     })),
-    gates: [...G.gates.values()].map((g) => ({
+  };
+  if (full) {
+    snap.gates = [...G.gates.values()].map((g) => ({
       k: g.k, state: g.state, lanes: g.lanes, progress: g.progress, lockT: g.lockT, openT: g.openT,
       off: g.off, flash: g.flash,
-    })),
-    cg: G.curGate ? G.curGate.k : null,
-    th: G.tethers.map((t) => ({
+    }));
+    snap.cg = G.curGate ? G.curGate.k : null;
+    snap.th = G.tethers.map((t) => ({
       kind: t.kind, a: t.a, b: t.b, time: r1(t.time), L: r1(t.L), rest: t.rest, max: t.max, k: t.k,
       slack: t.slack, goalY: t.goalY, snag: t.snag ? { x: t.snag.x, y: t.snag.y } : null,
-    })),
-    ev: NET.queue,
-  };
+    }));
+  }
+  return snap;
 }
 
-function netHostTick(dt) {
-  NET.sendT -= dt;
-  if (NET.sendT > 0) return;
-  NET.sendT = 1 / 30;
-  if (Net.conns.size) Net.broadcast(makeSnap());
-  NET.queue = [];
+// Cada fotograma: posiciones por el canal rápido (60/s; puertas y cuerdas cada 4 fotogramas).
+// Los efectos (sonidos, mensajes, parry…) por el canal fiable, porque no se pueden perder.
+function netHostTick() {
+  if (!Net.conns.size) { NET.queue = []; return; }
+  Net.broadcastFast(makeSnap(NET.frame++ % 4 === 0));
+  if (NET.queue.length) { Net.broadcast({ t: 'ev', ev: NET.queue }); NET.queue = []; }
 }
 
 const findNet = (peer, lid) => players.find((p) => p.src.type === 'net' && p.src.peer === peer && p.src.idx === lid);
@@ -1550,9 +1558,13 @@ function hostMessage(m, from) {
     const p = findNet(from, lid);
     if (p) leavePlayer(p);
   } else if (m.t === 'ping') {
-    const c = Net.conns.get(from);
-    if (c && c.open) c.send({ t: 'pong', c: m.c });
+    Net.sendFastTo(from, { t: 'pong', c: m.c });
   } else if (m.t === 'in') {
+    // Por el canal rápido pueden llegar desordenados: se ignora uno más viejo que el último
+    if (typeof m.seq === 'number') {
+      if (m.seq <= (NET.inSeqs[from] || 0)) return;
+      NET.inSeqs[from] = m.seq;
+    }
     NET.inputs[from] = m.p && typeof m.p === 'object' ? m.p : {};
   } else if (m.t === 'act') {
     const q = ((NET.acts[from] ||= {})[lid] ||= []);
@@ -1563,6 +1575,7 @@ function hostMessage(m, from) {
 function clientMessage(m) {
   if (m.t === 'lobby') applyLobby(m);
   else if (m.t === 's') applySnap(m);
+  else if (m.t === 'ev') applyEvents(m.ev);
   else if (m.t === 'full') backToMenu('La sala está llena.');
   else if (m.t === 'pong' && typeof m.c === 'number') {
     const rtt = (performance.now() - m.c) / 1000;
@@ -1583,6 +1596,11 @@ function applyLobby(m) {
 
 function applySnap(m) {
   if (state === 'menu' || m.st === 'lobby') return;
+  // Por el canal rápido pueden llegar desordenados: uno más viejo que el último se descarta
+  if (typeof m.seq === 'number') {
+    if (m.seq <= NET.lastSeq) return;
+    NET.lastSeq = m.seq;
+  }
   if (!G || G.seed !== m.seed) {
     makeWorld(m.seed);
     G.camY = (m.cars.reduce((s, c) => s + c.y, 0) / Math.max(1, m.cars.length)) - 50;
@@ -1648,13 +1666,21 @@ function applySnap(m) {
     if (Math.hypot(s.x - c.x, s.y - c.y) > 250) { c.x = s.x; c.y = s.y; c.a = s.a; }
     Object.assign(c, { drift: s.dr, slip: s.sl || 0, vx: s.vx, vy: s.vy });
   }
-  const seen = new Set();
-  for (const s of m.gates) { Object.assign(getGate(s.k), s); seen.add(s.k); }
-  for (const k of [...G.gates.keys()]) if (!seen.has(k)) G.gates.delete(k);
-  G.curGate = m.cg != null ? G.gates.get(m.cg) || null : null;
-  G.tethers = m.th || [];
+  if (m.gates) { // puertas y cuerdas vienen solo en los mensajes completos
+    const seen = new Set();
+    for (const s of m.gates) { Object.assign(getGate(s.k), s); seen.add(s.k); }
+    for (const k of [...G.gates.keys()]) if (!seen.has(k)) G.gates.delete(k);
+    G.curGate = m.cg != null ? G.gates.get(m.cg) || null : null;
+    G.tethers = m.th || [];
+  }
+}
+
+// Efectos que manda el host (por el canal fiable)
+function applyEvents(ev) {
+  if (!G || !Array.isArray(ev)) return;
+  const now = performance.now();
   NET.localBumps = NET.localBumps.filter((b) => now - b.t < 600);
-  for (const [name, args] of m.ev || []) {
+  for (const [name, args] of ev) {
     if (!FX[name]) continue;
     // Un choque que mi PC ya mostró al instante no se repite cuando llega el aviso del host
     if (name === 'bump' && NET.localBumps.some((b) => Math.hypot(b.x - args[0], b.y - args[1]) < 90)) continue;
@@ -1757,8 +1783,8 @@ function clientUpdate(dt) {
     const key = JSON.stringify(inp);
     NET.sendT -= dt;
     if (key !== NET.lastInp || NET.sendT <= 0) {
-      Net.send({ t: 'in', p: inp });
-      NET.lastInp = key; NET.sendT = 0.1;
+      Net.sendFast({ t: 'in', seq: ++NET.inSeq, p: inp });
+      NET.lastInp = key; NET.sendT = 0.05; // si alguno se pierde, el siguiente llega enseguida
     }
   }
   // ACCIÓN: se manda con la distancia que se ve en ESTA pantalla
@@ -1805,6 +1831,7 @@ const setMenuMsg = (t) => { $('menuMsg').textContent = t; };
 function enterLobby() {
   players.length = 0; G = null; state = 'lobby';
   NET.rtt = 0; NET.lat = 0; NET.lead = 0; NET.pingT = 0; NET.lastInp = '';
+  NET.lastSeq = 0; NET.inSeqs = {}; NET.routes = {};
   $('menu').hidden = true;
   $('netbar').hidden = Net.role === 'local';
   $('roomCode').textContent = Net.code;
@@ -1825,11 +1852,31 @@ function backToMenu(msg = '') {
   setMenuMsg(msg);
   if (location.search) history.replaceState(null, '', location.pathname);
 }
+async function checkRoutes() {
+  const conns = Net.role === 'host' ? [...Net.conns.entries()] : Net.conn ? [['host', Net.conn]] : [];
+  const routes = {};
+  for (const [id, c] of conns) {
+    try { routes[id] = await Net.route(c); } catch (e) { routes[id] = null; }
+  }
+  NET.routes = routes;
+  updateNetInfo();
+}
+// "directo" o "vía relay (servidor)"; en el host, un resumen de todos los PC conectados
+function routeText() {
+  const rs = Object.values(NET.routes).filter(Boolean);
+  if (!rs.length) return '';
+  const relays = rs.filter((r) => r.relay);
+  if (!relays.length) return rs.length > 1 ? `${rs.length} directos` : 'directo';
+  if (rs.length === 1) return `vía relay${relays[0].server ? ' (' + relays[0].server + ')' : ''}`;
+  return `${rs.length - relays.length} directos, ${relays.length} vía relay`;
+}
 function updateNetInfo() {
   if (Net.role === 'local') return;
   const who = Net.role === 'host' ? `${Net.conns.size} PC conectados`
     : `ping ${NET.rtt ? Math.round(NET.rtt * 1000) + ' ms' : '…'}`;
-  $('netInfo').textContent = `${players.length}/4 jugadores · ${who}`;
+  const route = routeText();
+  $('netInfo').textContent = `${players.length}/4 jugadores · ${who}${route ? ' · ' + route : ''}`;
+  $('netInfo').style.color = /relay/.test(route) ? '#ffd23f' : '';
 }
 function joinRoom(code) {
   code = code.trim().toUpperCase();

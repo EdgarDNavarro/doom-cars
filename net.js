@@ -45,6 +45,7 @@ const Net = {
           return;
         }
         this.conns.set(conn.peer, conn);
+        this.attachFast(conn, conn.peer);
         this.handlers.join(conn.peer);
       });
       conn.on('data', (d) => this.handlers.message(d, conn.peer));
@@ -64,7 +65,7 @@ const Net = {
     peer.on('open', (id) => {
       this.id = id;
       const conn = this.conn = peer.connect(this.prefix + code, { reliable: true, serialization: 'json' });
-      conn.on('open', () => { this.role = 'client'; this.code = code; finish(null); });
+      conn.on('open', () => { this.role = 'client'; this.code = code; this.attachFast(conn, 'host'); finish(null); });
       conn.on('data', (d) => this.handlers.message(d, 'host'));
       conn.on('close', () => { if (this.role === 'client' && this.conn === conn) this.handlers.closed(); });
       conn.on('error', () => {});
@@ -76,6 +77,54 @@ const Net = {
 
   send(msg) { if (this.conn && this.conn.open) this.conn.send(msg); },
   broadcast(msg) { for (const c of this.conns.values()) if (c.open) c.send(msg); },
+
+  // Canal rápido: sin orden ni reenvíos (como UDP). Para posiciones y controles, que se
+  // mandan muy seguido: si se pierde uno, no se espera a reenviarlo, ya llega el siguiente.
+  // Es un segundo canal "pactado" (mismo id en los dos lados) sobre la misma conexión.
+  FAST_ID: 1001,
+  attachFast(conn, from) {
+    try {
+      const ch = conn.peerConnection.createDataChannel('rapido', { negotiated: true, id: this.FAST_ID, ordered: false, maxRetransmits: 0 });
+      ch.onmessage = (e) => {
+        let m;
+        try { m = JSON.parse(e.data); } catch (err) { return; }
+        this.handlers.message(m, from);
+      };
+      conn.fast = ch;
+    } catch (err) { conn.fast = null; } // sin canal rápido: todo va por el fiable
+  },
+  fastOpen(conn) { return !!(conn && conn.fast && conn.fast.readyState === 'open'); },
+  sendFast(msg) {
+    if (this.fastOpen(this.conn)) this.conn.fast.send(JSON.stringify(msg));
+    else this.send(msg);
+  },
+  sendFastTo(peer, msg) {
+    const c = this.conns.get(peer);
+    if (this.fastOpen(c)) c.fast.send(JSON.stringify(msg));
+    else if (c && c.open) c.send(msg);
+  },
+  broadcastFast(msg) {
+    let s = null;
+    for (const c of this.conns.values()) {
+      if (this.fastOpen(c)) c.fast.send(s || (s = JSON.stringify(msg)));
+      else if (c.open) c.send(msg);
+    }
+  },
+
+  // Ruta de una conexión: directa (P2P) o por un servidor intermedio (relay/TURN)
+  async route(conn) {
+    const pc = conn && conn.peerConnection;
+    if (!pc || !pc.getStats) return null;
+    const stats = await pc.getStats();
+    let pair = null;
+    stats.forEach((s) => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId); });
+    if (!pair) stats.forEach((s) => { if (!pair && s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected)) pair = s; });
+    if (!pair) return null;
+    const l = stats.get(pair.localCandidateId), r = stats.get(pair.remoteCandidateId);
+    const relay = (l && l.candidateType === 'relay') || (r && r.candidateType === 'relay');
+    const server = relay ? ((l && l.candidateType === 'relay' && l.url) || (r && r.address) || '') : '';
+    return { relay, server: server.replace(/^turns?:/, '').replace(/\?.*$/, '') };
+  },
 
   leave() {
     const p = this.peer;
