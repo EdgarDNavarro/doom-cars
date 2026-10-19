@@ -748,7 +748,8 @@ function startJump(car, z) {
 }
 function launch(car) {
   const a = car.air;
-  a.mode = 'launch'; a.t = 0; a.fromY = car.y; a.toY = a.top - rand(70, 150); a.fromZ = a.z;
+  // Aterrizaje siempre a la misma distancia del borde: así el cliente puede predecirlo exacto
+  a.mode = 'launch'; a.t = 0; a.fromY = car.y; a.toY = a.top - 110; a.fromZ = a.z;
   car.vx = 0; car.vy = 0;
 }
 // loose: sin exigir que el objetivo vaya delante (para aceptar pulsaciones remotas con lag)
@@ -1162,13 +1163,16 @@ function updateCamera(dt, viewOnly = false) {
     let target = (minY + maxY) / 2 - viewH * 0.08;
     // El líder manda: el que se queda atrás sale de pantalla (salvo durante un salto en cadena)
     if (!jumping) target = Math.min(target, minY + viewH * 0.3);
-    G.camY += (target - G.camY) * Math.min(1, dt * 3.5);
+    // El que va primero siempre queda a la vista: la cámara lo sigue (antes lo frenaba contra el
+    // borde de arriba, pero eso en online no se puede predecir y daba tirones)
+    target = Math.min(target, minY + viewH / 2 - 60);
+    const fast = minY < G.camY - viewH / 2 + 90;
+    G.camY += (target - G.camY) * Math.min(1, dt * (fast ? 9 : 3.5));
   }
   if (viewOnly) return;
-  const top = G.camY - viewH / 2, bottom = G.camY + viewH / 2;
+  const bottom = G.camY + viewH / 2;
   for (const c of live) {
     if (c.air) continue;
-    if (c.y < top + 40) { c.y = top + 40; if (c.vy < 0) c.vy *= 0.2; }
     if (state === 'play' && !jumping && c.y > bottom + 30) killCar(c, 'se quedó atrás');
   }
 }
@@ -1215,7 +1219,7 @@ function update(dt) {
   if (!G) return;
   if (Net.role === 'host') netHostTick(dt);
   G.flash = Math.max(0, G.flash - dt * 3);
-  if (G.hitstop > 0) { G.hitstop -= dt; return; } // congelado breve tras un parry
+  if (G.hitstop > 0) { G.hitstop = Math.max(0, G.hitstop - dt); return; } // congelado breve tras un parry
   for (let i = G.links.length - 1; i >= 0; i--) if ((G.links[i].t -= dt) <= 0) G.links.splice(i, 1);
   for (let i = G.bolts.length - 1; i >= 0; i--) if ((G.bolts[i].t -= dt) <= 0) G.bolts.splice(i, 1);
   if (G.teamPop && (G.teamPop.t -= dt) <= 0) G.teamPop = null;
@@ -1407,8 +1411,7 @@ function predictCollisions(me) {
 // Estado de mi carro en un instante pasado (interpolado del historial de la predicción)
 function histAt(c, t) {
   const h = c.hist;
-  if (!h || !h.length) return null;
-  if (t <= h[0].t) return h[0];
+  if (!h || !h.length || t < h[0].t) return null; // sin historial suficiente: no se compara
   for (let i = h.length - 1; i > 0; i--) {
     if (h[i - 1].t <= t) {
       const a = h[i - 1], b = h[i], k = (t - a.t) / Math.max(1, b.t - a.t);
@@ -1418,9 +1421,45 @@ function histAt(c, t) {
   return h[h.length - 1];
 }
 
+// Despegue simulado en el cliente (mismas reglas que startJump/updateAir del host). Cuando el
+// host confirma el salto, el carro pasa a mostrarse con lo que diga el host.
+function startLocalAir(c, z) {
+  const speed = clamp(-c.vy, 260, CAR_MAX);
+  const gliders = G.cars.some((o) => o !== c && o.air && o.air.zone === z.k && o.air.mode !== 'launch');
+  const behind = G.cars.some((o) => o !== c && o.alive && !o.falling && !o.air && o.y > z.bot - 5);
+  const solo = !gliders && !behind;
+  c.localAir = { t: 0, solo, top: z.top, fromY: c.y, toY: z.top - 110, vy: -speed, z: 1 };
+  c.vx *= 0.3; c.drift = null; c.hist = []; c.corr = null;
+  c.air = c.localAirState = { zone: z.k, top: z.top, bot: z.bot, mode: solo ? 'launch' : 'fly', z: 1, t: 0, glideT: 0 };
+  c.localJumpAt = performance.now();
+  FX.jump(c.id); // sonido y polvo ya (el aviso del host de este salto se ignora)
+}
+function localAirStep(c, dt, inp) {
+  const la = c.localAir;
+  la.t += dt;
+  c.x = clamp(c.x + inp.steer * 170 * dt, CAR_R, ROAD_W - CAR_R);
+  if (la.solo) {
+    const k = Math.min(1, la.t / 0.75);
+    c.y = la.fromY + (la.toY - la.fromY) * easeOut(k);
+    c.air.z = Math.sin(Math.PI * k) * 0.9 + (1 - k) * (la.z != null ? la.z : 1);
+    if (k >= 1) { // aterricé en mi PC: sigue la predicción en el suelo (como tras el lanzamiento del host)
+      c.localAir = null; c.air = null; c.landedLocal = true;
+      c.vx = 0; c.vy = -140; c.hist = []; c.corr = null;
+      return;
+    }
+  } else {
+    c.y += la.vy * dt;
+    la.vy *= Math.exp(-1.2 * dt);
+    if (c.y < la.top + 40) { c.y = la.top + 40; la.vy = 0; }
+    c.air.z = 0.6 + 0.4 * Math.exp(-la.t * 2);
+  }
+  c.vy = la.vy; c.vx = 0;
+  if (la.t > 0.8) { c.localAir = null; c.air = null; c.hist = []; } // el host nunca confirmó: vuelta a la normalidad
+}
+
 // En el cliente, mi propio carro en el suelo se mueve con predicción local
 function predicting(c) {
-  return Net.role === 'client' && state === 'play' && c.alive && !c.falling && !c.air &&
+  return Net.role === 'client' && state === 'play' && c.alive && !c.falling && (!c.air || c.localAir) &&
     players.some((p) => p.mine && p.slot === c.id);
 }
 // Misma conducción que el host (incluido el derrape y su mini-turbo), pero sin efectos:
@@ -1562,14 +1601,33 @@ function applySnap(m) {
     });
     // Mi carro en el suelo lo mueve la predicción local. Lo que manda el host refleja mis
     // teclas de hace un ping, así que se compara con dónde estaba mi carro entonces.
+    // Despegué en mi PC: mientras el host no lo confirme, se mantiene mi vuelo local;
+    // cuando lo confirma, manda el host
+    if (c.localAir) {
+      // Despegue: termina cuando el host me pone en el aire. Lanzamiento tras parry: cuando el
+      // host también me lanza (o ya aterricé allá)
+      // Si mi PC ya me está lanzando, sigo con mi curva hasta aterrizar (el host hace la misma);
+      // si yo preveía planear, en cuanto el host me pone en el aire manda él.
+      const la = c.localAir;
+      const done = la.solo ? !s.air && la.until === 'launch' : !!s.air;
+      if (done) c.localAir = null;
+      else { c.air = c.localAirState; continue; }
+    }
+    // Ya aterricé en mi PC pero el host aún me tiene en el aire: sigo con la predicción
+    if (c.landedLocal) {
+      if (s.air && s.air.mode === 'launch') c.air = null;
+      else c.landedLocal = false;
+    }
     if (predicting(c)) {
+      if (s.air) continue; // el host aún no confirmó el aterrizaje: nada que comparar todavía
       // Calibración automática del retraso: se prueba alrededor del valor actual y se queda con
       // el que mejor encaja con mi historial (el ping solo no incluye fotogramas ni envíos).
       // Solo en conducción "limpia" (sin choques recientes ni cuerda), porque un golpe que mi PC
       // no predijo igual desajustaría la calibración.
       if (!NET.lat) NET.lat = NET.rtt + SNAP_DELAY;
       const clean = c.slide <= 0 && !tetherOf(c) && (!c.lastBump || now - c.lastBump > 800);
-      if (clean && Math.hypot(c.vx, c.vy) > 80 && c.hist && c.hist.length > 20) {
+      const span = c.hist && c.hist.length ? (now - c.hist[0].t) / 1000 : 0;
+      if (clean && Math.hypot(c.vx, c.vy) > 80 && span > NET.lat + 0.08) {
         let best = NET.lat, bestErr = Infinity;
         for (let off = -0.05; off <= 0.0501; off += 0.01) {
           const h = histAt(c, now - (NET.lat + off) * 1000);
@@ -1600,6 +1658,8 @@ function applySnap(m) {
     if (!FX[name]) continue;
     // Un choque que mi PC ya mostró al instante no se repite cuando llega el aviso del host
     if (name === 'bump' && NET.localBumps.some((b) => Math.hypot(b.x - args[0], b.y - args[1]) < 90)) continue;
+    if (name === 'jump') { const jc = carById(args[0]); if (jc && jc.localJumpAt && now - jc.localJumpAt < 1500) continue; }
+    if (name === 'parry' && NET.localParryAt && now - NET.localParryAt < 1500) continue; // ya lo mostré
     FX[name](...args);
   }
 }
@@ -1618,24 +1678,51 @@ function clientUpdate(dt) {
   // Los demás carros. Lo que manda el host ya es pasado (medio ping), y mi carro va adelantado
   // (medio ping más, porque mis teclas tardan en llegar al host). Para que los choques se vean
   // donde de verdad ocurren, los demás se proyectan con su velocidad hasta mi mismo instante.
-  const lead = preds.length ? (NET.lat || NET.rtt + SNAP_DELAY) : 0;
+  // Mientras tenga un carro vivo, todo se muestra en "mi instante" (también mi carro en el aire).
+  // El adelanto cambia suave para que nada salte de sitio al despegar o aterrizar.
+  const meAlive = G.cars.some((c) => c.alive && !c.falling && mine.some((p) => p.slot === c.id));
+  const leadTarget = meAlive && state === 'play' ? (NET.lat || NET.rtt + SNAP_DELAY) : 0;
+  NET.lead = (NET.lead || 0) + (leadTarget - (NET.lead || 0)) * Math.min(1, dt * 4);
+  const lead = NET.lead;
   for (const c of G.cars) {
     if (c.tx === undefined || preds.includes(c)) continue;
     const age = Math.min(0.15, (now - c.recv) / 1000);
-    const flying = c.air && c.air.mode === 'launch';
-    const ext = flying ? 0 : Math.min(REMOTE_LEAD_MAX, age + (c.alive && !c.falling ? lead : 0));
-    c.x += (c.tx + c.tvx * ext - c.x) * k;
-    c.y += (c.ty + c.tvy * ext - c.y) * k;
+    const ext = Math.min(REMOTE_LEAD_MAX, age + (c.alive && !c.falling ? lead : 0));
+    const a = c.air;
+    if (a && a.mode === 'launch' && a.fromY !== undefined) {
+      // El lanzamiento es una curva conocida: se calcula en el instante que toca, sin estimar
+      const t = a.t + ext, kk = Math.min(1, t / 0.75);
+      a.z = a.fromZ * (1 - kk) + Math.sin(Math.PI * kk) * 0.9;
+      c.y += (a.fromY + (a.toY - a.fromY) * easeOut(kk) - c.y) * k;
+      c.x += (c.tx - c.x) * k;
+      // Mi carro ya aterrizó en mi instante: la predicción retoma desde aquí (como en el host)
+      if (kk >= 1 && mine.some((p) => p.slot === c.id) && state === 'play') {
+        c.y = a.toY; c.vx = 0; c.vy = -140; c.air = null; c.landedLocal = true;
+        c.hist = []; c.corr = null; c.drift = null; c.slip = 0;
+      }
+    } else {
+      c.x += (c.tx + c.tvx * ext - c.x) * k;
+      c.y += (c.ty + c.tvy * ext - c.y) * k;
+    }
     const da = Math.atan2(Math.sin(c.ta - c.a), Math.cos(c.ta - c.a));
     c.a += da * k;
   }
 
   for (const c of preds) {
     {
-      // Predicción: mi carro responde al instante a mis teclas…
       const p = mine.find((q) => q.slot === c.id);
-      if (p && !G.hitstop) {
+      // Despegue en mi PC: hasta que el host confirme el salto, el vuelo se simula aquí igual
+      // que allá (así no hay salto brusco al pasar la rampa)
+      if (c.localAir) {
+        if (G.hitstop <= 0) localAirStep(c, dt, p ? getInput({ src: srcFromLid(p.lid) }) : { steer: 0 });
+        continue;
+      }
+      // Predicción: mi carro responde al instante a mis teclas…
+      if (p && G.hitstop <= 0) {
+        const prevY = c.y;
         predictCar(c, dt, getInput({ src: srcFromLid(p.lid) }));
+        const z = jumpZoneNear(Math.floor(c.y / T));
+        if (z && prevY >= z.bot && c.y < z.bot) { startLocalAir(c, z); continue; }
         const t = tetherOf(c);
         if (t) tetherPhysics(t, dt, c); // el tirón de la cuerda también se siente al instante
         predictCollisions(c);           // y los choques con los demás, justo cuando se tocan
@@ -1647,8 +1734,8 @@ function clientUpdate(dt) {
         // Si la diferencia es enorme, o mediana pero no se va (p. ej. tras un choque mi PC dejó
         // mi carro al otro lado del rival), se corrige de golpe en vez de pelear contra el choque
         const mag = Math.hypot(cr.x, cr.y);
-        c.corrBad = mag > 40 ? (c.corrBad || 0) + dt : 0;
-        const big = mag > PREDICT_SNAP || c.corrBad > 0.4;
+        c.corrBad = mag > 50 ? (c.corrBad || 0) + dt : 0;
+        const big = mag > PREDICT_SNAP || c.corrBad > 1.0;
         if (big) c.corrBad = 0;
         const kp = big ? 1 : 1 - Math.exp(-PREDICT_PULL * dt);
         const mx = cr.x * kp, my = cr.y * kp, mvx = cr.vx * kp, mvy = cr.vy * kp, ma = cr.a * kp;
@@ -1682,6 +1769,18 @@ function clientUpdate(dt) {
     if (!car.air) { if (car.combo) Net.send({ t: 'act', lid: p.lid, d: null }); continue; } // cobrar combo
     const tg = parryTarget(car);
     Net.send({ t: 'act', lid: p.lid, d: tg ? Math.round(tg.d) : null });
+    // Parry acertado en mi pantalla: se muestra ya (el host casi siempre lo acepta, tiene margen
+    // para el lag). Mi carro sale lanzado al instante o se queda planeando si hay gente detrás.
+    if (tg && tg.d <= PARRY_WIN && car.parryCd <= 0 && !car.localAir) {
+      FX.parry(car.id, tg.car.id, tg.d < 18);
+      NET.localParryAt = performance.now();
+      const z = jumpZone(car.air.zone);
+      const behind = G.cars.some((o) => o !== car && o.alive && !o.falling && !o.air && o.y > z.bot - 5);
+      if (!behind) {
+        car.localAir = { t: 0, solo: true, top: z.top, fromY: car.y, toY: z.top - 110, vy: 0, z: car.air.z, until: 'launch' };
+        car.air = car.localAirState = Object.assign({}, car.air, { mode: 'launch' });
+      }
+    }
   }
 }
 
@@ -1705,7 +1804,7 @@ const $ = (id) => document.getElementById(id);
 const setMenuMsg = (t) => { $('menuMsg').textContent = t; };
 function enterLobby() {
   players.length = 0; G = null; state = 'lobby';
-  NET.rtt = 0; NET.lat = 0; NET.pingT = 0; NET.lastInp = '';
+  NET.rtt = 0; NET.lat = 0; NET.lead = 0; NET.pingT = 0; NET.lastInp = '';
   $('menu').hidden = true;
   $('netbar').hidden = Net.role === 'local';
   $('roomCode').textContent = Net.code;
