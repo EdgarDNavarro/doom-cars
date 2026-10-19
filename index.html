@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fin del Mundo Cars</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0a14; overflow: hidden; font-family: "Trebuchet MS", sans-serif; color: #eee; }
+    canvas { display: block; }
+    .overlay {
+      position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 14px; padding: 16px; box-sizing: border-box; text-align: center;
+    }
+    .overlay[hidden], #netbar[hidden] { display: none; }
+    h1 { margin: 0; font-size: clamp(40px, 9vw, 76px); color: #ff4d5e; text-shadow: 0 4px 0 #000; letter-spacing: 1px; }
+    .sub { margin: 0 0 18px; color: #bbb; }
+    button, input {
+      font: bold 18px "Trebuchet MS", sans-serif; border-radius: 12px; border: 3px solid #3a3550;
+      background: #1c1a2a; color: #eee; padding: 12px 20px;
+    }
+    button { cursor: pointer; min-width: 280px; }
+    button:hover, button:focus-visible { border-color: #ffd23f; outline: none; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    .row button { min-width: 0; }
+    input { width: 150px; text-transform: uppercase; letter-spacing: 4px; text-align: center; }
+    input:focus { border-color: #3fa7ff; outline: none; }
+    #menuMsg { min-height: 22px; color: #ff8a8a; margin: 4px 0 0; }
+    .hint { color: #888; font-size: 14px; max-width: 520px; }
+    #netbar {
+      position: fixed; left: 50%; bottom: 12px; transform: translateX(-50%); display: flex; gap: 10px; align-items: center;
+      background: rgba(10, 9, 18, 0.85); border: 2px solid #3a3550; border-radius: 12px; padding: 6px 10px; font-size: 15px;
+      white-space: nowrap; max-width: calc(100vw - 32px); overflow: hidden;
+    }
+    #netbar b { color: #ffd23f; letter-spacing: 3px; font-size: 18px; }
+    #netbar button { min-width: 0; padding: 4px 10px; font-size: 14px; border-width: 2px; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <div id="menu" class="overlay">
+    <h1>FIN DEL MUNDO</h1>
+    <p class="sub">carros contra el colapso · 1 a 4 jugadores</p>
+    <button id="btnLocal">Jugar local (misma pantalla)</button>
+    <button id="btnHost">Crear sala online</button>
+    <div class="row">
+      <input id="codeInput" maxlength="5" placeholder="CÓDIGO" autocomplete="off" spellcheck="false">
+      <button id="btnJoin">Unirse a sala</button>
+    </div>
+    <p id="menuMsg"></p>
+    <p class="hint">Online: cada PC puede meter uno o más jugadores (teclado o mando). Máximo 4 en total.</p>
+  </div>
+
+  <div id="netbar" hidden>
+    <span>Sala</span> <b id="roomCode"></b>
+    <button id="btnCopy">Copiar enlace</button>
+    <span id="netInfo"></span>
+    <button id="btnLeave">Salir</button>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="net.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
