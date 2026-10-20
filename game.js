@@ -1382,6 +1382,10 @@ const NET = {
   seq: 0, frame: 0, lastSeq: 0, inSeq: 0, inSeqs: {}, routes: {}, routeT: 0,
 };
 const PREDICT_SNAP = 160;  // si la predicción se aleja más que esto del host, se corrige de golpe
+// Predicción del cliente. Desactivada: cada uno ve su carro tal como lo mueve el host (las
+// teclas van al host y vuelven). Con poco ping se siente directo y nunca hay correcciones.
+// Poner en true para que el carro propio responda al instante y se corrija con el host.
+const PREDICTION = false;
 const PREDICT_PULL = 4;    // fuerza de la corrección suave hacia el host (más alto = más rígido)
 const SNAP_DELAY = 0.025;  // retraso extra del estado del host además del ping (su fotograma + envío)
 const REMOTE_LEAD_MAX = 0.3; // cuánto como máximo se proyectan hacia delante los demás carros (s)
@@ -1464,7 +1468,7 @@ function localAirStep(c, dt, inp) {
 
 // En el cliente, mi propio carro en el suelo se mueve con predicción local
 function predicting(c) {
-  return Net.role === 'client' && state === 'play' && c.alive && !c.falling && (!c.air || c.localAir) &&
+  return PREDICTION && Net.role === 'client' && state === 'play' && c.alive && !c.falling && (!c.air || c.localAir) &&
     players.some((p) => p.mine && p.slot === c.id);
 }
 // Misma conducción que el host (incluido el derrape y su mini-turbo), pero sin efectos:
@@ -1697,7 +1701,8 @@ function clientUpdate(dt) {
   if (G.turbo > 0) { G.turbo = Math.max(0, G.turbo - dt); G.team = G.turbo / TURBO_TIME; }
   for (const g of G.gates.values()) if (g.state === 'open') g.openT += dt;
 
-  const now = performance.now(), k = 1 - Math.exp(-18 * dt);
+  // Suavizado hacia lo que manda el host: con 60 mensajes/s puede ser rígido (menos retraso visual)
+  const now = performance.now(), k = 1 - Math.exp(-35 * dt);
   const mine = players.filter((p) => p.mine);
   const preds = G.cars.filter((c) => c.tx !== undefined && predicting(c));
 
@@ -1707,7 +1712,7 @@ function clientUpdate(dt) {
   // Mientras tenga un carro vivo, todo se muestra en "mi instante" (también mi carro en el aire).
   // El adelanto cambia suave para que nada salte de sitio al despegar o aterrizar.
   const meAlive = G.cars.some((c) => c.alive && !c.falling && mine.some((p) => p.slot === c.id));
-  const leadTarget = meAlive && state === 'play' ? (NET.lat || NET.rtt + SNAP_DELAY) : 0;
+  const leadTarget = PREDICTION && meAlive && state === 'play' ? (NET.lat || NET.rtt + SNAP_DELAY) : 0;
   NET.lead = (NET.lead || 0) + (leadTarget - (NET.lead || 0)) * Math.min(1, dt * 4);
   const lead = NET.lead;
   for (const c of G.cars) {
@@ -1722,7 +1727,7 @@ function clientUpdate(dt) {
       c.y += (a.fromY + (a.toY - a.fromY) * easeOut(kk) - c.y) * k;
       c.x += (c.tx - c.x) * k;
       // Mi carro ya aterrizó en mi instante: la predicción retoma desde aquí (como en el host)
-      if (kk >= 1 && mine.some((p) => p.slot === c.id) && state === 'play') {
+      if (PREDICTION && kk >= 1 && mine.some((p) => p.slot === c.id) && state === 'play') {
         c.y = a.toY; c.vx = 0; c.vy = -140; c.air = null; c.landedLocal = true;
         c.hist = []; c.corr = null; c.drift = null; c.slip = 0;
       }
@@ -1797,7 +1802,7 @@ function clientUpdate(dt) {
     Net.send({ t: 'act', lid: p.lid, d: tg ? Math.round(tg.d) : null });
     // Parry acertado en mi pantalla: se muestra ya (el host casi siempre lo acepta, tiene margen
     // para el lag). Mi carro sale lanzado al instante o se queda planeando si hay gente detrás.
-    if (tg && tg.d <= PARRY_WIN && car.parryCd <= 0 && !car.localAir) {
+    if (PREDICTION && tg && tg.d <= PARRY_WIN && car.parryCd <= 0 && !car.localAir) {
       FX.parry(car.id, tg.car.id, tg.d < 18);
       NET.localParryAt = performance.now();
       const z = jumpZone(car.air.zone);
