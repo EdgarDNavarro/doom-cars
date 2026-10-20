@@ -30,8 +30,8 @@ const GLIDE_TIME = 3.0;       // segundos que alguien planea esperando a que lo 
 const PARRY_RANGE = 170;      // distancia a la que aparece el anillo de timing
 const PARRY_WIN = 42;         // ventana del parry (distancia entre carros)
 const LANE_ROWS = 18;         // largo (en baldosas) del tramo de carriles antes de cada puerta
-const LANE_W = 76;            // ancho de cada carril (~2,5 carros), igual para cualquier nº de jugadores
-const LANE_OBS = 0.07;        // probabilidad de obstáculo por baldosa en el tramo de carriles
+const LANE_W = 90;            // ancho de cada carril (~2,5 carros), igual para cualquier nº de jugadores
+const LANE_OBS = 0.02;        // probabilidad de obstáculo por baldosa en el tramo de carriles
 const HOLD_TIME = 2.5;        // segundos que todos deben ir en su carril a la vez
 const LOCK_TIME = 2.5;        // bloqueo cuando alguien muere durante el evento
 const DOOM_START = 380;       // posición inicial del colapso (detrás de los carros)
@@ -40,7 +40,7 @@ const DOOM_ACCEL = 2;         // cuánto acelera por segundo
 const DOOM_MAX = 280;
 const CAR_MAX = 330, CAR_REV = 150, CAR_ACC = 520, CAR_BRAKE = 900, CAR_TURN = 3.4;
 const ZAP_EVERY = [22, 35];   // cada cuántos segundos cae un rayo (aleatorio entre ambos)
-const ZAP_TIME = 12;          // duración de la avería si nadie ayuda
+const ZAP_TIME = 10;          // duración de la avería si nadie ayuda
 const ZAP_HIT = 8;          // segundos que resta cada choque de un compañero
 const ZAP_SPEED = 0.85;       // velocidad máxima con avería (-15 %)
 const ZAP_TURN = 0.3;         // giro hacia el lado averiado (30 % de lo normal)
@@ -409,6 +409,12 @@ const FX = {
       for (let n = 0; n < 16; n++) addP({ x: rand(a, b), y: g.zoneBot - rand(0, 30), vx: rand(-40, 40), vy: rand(-160, -40), life: rand(0.5, 1), color: ln.color, size: rand(3, 6), kind: 'sq', drag: 2 });
     });
   },
+  gateFree(k) {
+    const g = G.gates.get(k);
+    setMsg('Remolque en curso: ¡paso libre!', '#c8cdd8', 1.8);
+    Sound.open();
+    if (g) burst(ROAD_W / 2, g.y, '#3ddc84', 24, 260);
+  },
   gateOpen(k) {
     const g = G.gates.get(k);
     G.shake = Math.max(G.shake, 10);
@@ -654,7 +660,12 @@ function updateGates(dt) {
     if (G.doomY < g.y - 40) { if (g.state !== 'open') g.state = 'dead'; continue; }
 
     if (g.state === 'idle') {
-      if (state === 'play' && alive.some((c) => c.y < g.zoneBot + 7 * T)) activateGate(g);
+      if (state === 'play' && alive.some((c) => c.y < g.zoneBot + 7 * T)) {
+        // Con un remolque en curso no hay carriles: la puerta se abre sola (si esperara, la
+        // recarga podría quedar al otro lado y se quedarían atascados)
+        if (G.tethers.some((t) => t.kind === 'tow')) { g.state = 'open'; g.openT = 0; g.progress = 1; fx('gateFree', g.k); }
+        else activateGate(g);
+      }
     } else if (g.state === 'active') {
       G.curGate = g;
       let all = alive.length > 0;
@@ -932,6 +943,8 @@ function nearestTo(car, list) {
   return best;
 }
 function startTether(kind) {
+  // No empieza un remolque en mitad de un evento de carriles
+  if (kind === 'tow' && G.curGate) return false;
   const free = freeCars();
   if (free.length < 2) return false;
   const a = free[Math.floor(Math.random() * free.length)], b = nearestTo(a, free);
