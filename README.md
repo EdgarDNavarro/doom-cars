@@ -20,6 +20,8 @@ En el menú elige:
 
 Cada jugador se une pulsando **acelerar** en su control y el host empieza con **Enter / Espacio / Start**.
 
+En el lobby, el host (o el modo local) puede añadir **bots** con **B** y quitarlos con **N**. Los bots conducen solos y juegan todos los eventos.
+
 ### Controles
 
 | Jugador | Conducir | Acción (parry / cobrar combo) | Derrape |
@@ -33,7 +35,7 @@ Cada jugador se une pulsando **acelerar** en su control y el host empieza con **
 ## Mecánicas
 
 - **El colapso**: el suelo se agrieta y cae detrás de ustedes, cada vez más rápido. Quien se queda atrás, cae.
-- **Carriles de color**: antes de cada puerta, todos deben ir por su carril a la vez para abrirla.
+- **Carriles de color**: antes de cada puerta aparecen carriles rectos, separados y en orden al azar; todos deben ir por el suyo a la vez para abrirla.
 - **Salto con parry**: el primero planea sobre el abismo; el siguiente lo engancha pulsando ACCIÓN en el momento justo.
 - **Rayo**: un carro averiado (más lento y gira mal hacia un lado); los demás lo reparan chocándolo.
 - **Cuerda**: dos carros atados 15 s; se traban en los obstáculos.

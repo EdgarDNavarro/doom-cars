@@ -266,12 +266,23 @@ function padPressed(i, b) {
 // ---------------------------------------------------------------------
 //  Jugadores
 // ---------------------------------------------------------------------
-// src: {type:'kb'|'pad', idx} en este PC, o {type:'net', peer, idx:lid} en otro PC (solo en el host).
-// En los clientes, la lista llega del host: {slot, label, act, mine, lid}.
+// src: {type:'kb'|'pad', idx} en este PC, {type:'bot', idx} (lo maneja la máquina) o
+// {type:'net', peer, idx:lid} en otro PC (solo en el host).
+// En los clientes, la lista llega del host: {slot, label, act, mine, lid, bot}.
 const players = [];
-const srcLabel = (src) => (src.type === 'kb' ? SCHEMES[src.idx].label : `Mando ${src.idx + 1}`);
-const srcAct = (src) => (src.type === 'kb' ? SCHEMES[src.idx].act : 'X');
-const srcDrift = (src) => (src.type === 'kb' ? SCHEMES[src.idx].dft : 'RB');
+const srcLabel = (src) => (src.type === 'kb' ? SCHEMES[src.idx].label : src.type === 'bot' ? `Bot ${src.idx}` : `Mando ${src.idx + 1}`);
+const srcAct = (src) => (src.type === 'kb' ? SCHEMES[src.idx].act : src.type === 'bot' ? 'IA' : 'X');
+const srcDrift = (src) => (src.type === 'kb' ? SCHEMES[src.idx].dft : src.type === 'bot' ? 'IA' : 'RB');
+const isBot = (p) => (p.src ? p.src.type === 'bot' : !!p.bot);
+function addBot() {
+  if (players.length >= 4) return;
+  let n = 1; while (findPlayer('bot', n)) n++;
+  joinPlayer({ type: 'bot', idx: n });
+}
+function removeBot() {
+  const bots = players.filter((p) => p.src.type === 'bot');
+  if (bots.length) leavePlayer(bots[bots.length - 1]);
+}
 function findPlayer(type, idx) { return players.find((p) => p.src && p.src.type === type && p.src.idx === idx); }
 function joinPlayer(src, label, act, dft) {
   if (players.length >= 4) return;
@@ -284,9 +295,10 @@ function joinPlayer(src, label, act, dft) {
 }
 function leavePlayer(p) { players.splice(players.indexOf(p), 1); Sound.leave(); sendLobby(); }
 // ¿Lo controla alguien sentado en este PC?
-const isMine = (p) => (Net.role === 'client' ? !!p.mine : p.src.type !== 'net');
+const isMine = (p) => (Net.role === 'client' ? !!p.mine : p.src.type === 'kb' || p.src.type === 'pad');
 
 function getInput(p) {
+  if (p.src.type === 'bot') return botInput(p);
   if (p.src.type === 'net') {
     const i = NET.inputs[p.src.peer] && NET.inputs[p.src.peer][p.src.idx];
     return i ? { thr: clamp(+i.thr || 0, -1, 1), steer: clamp(+i.steer || 0, -1, 1), drift: !!i.drift } : { thr: 0, steer: 0, drift: false };
@@ -317,6 +329,7 @@ function actionPressed(p) {
 // Devuelve la pulsación de ACCIÓN de este frame: {d} trae la distancia que vio el jugador remoto
 function takeAction(p) {
   if (!p) return null;
+  if (p.src.type === 'bot') { const a = p.botAct; p.botAct = false; return a ? { d: null } : null; }
   if (p.src.type === 'net') {
     const q = NET.acts[p.src.peer] && NET.acts[p.src.peer][p.src.idx];
     return q && q.length ? q.shift() : null;
@@ -324,6 +337,92 @@ function takeAction(p) {
   return actionPressed(p) ? { d: null } : null;
 }
 function actionLabel(p) { return p.act; }
+
+// ---------------------------------------------------------------------
+//  Bots: conducen solos. Siguen el camino libre esquivando obstáculos, van a su carril en las
+//  puertas, intentan el parry (no siempre aciertan), embisten al que tiene rayo para
+//  repararlo y, sin motor, siguen al que los remolca. Solo corren en el host o en local.
+// ---------------------------------------------------------------------
+const BOT_PARRY_SKILL = [0.65, 0.9]; // probabilidad de acertar el parry (cada bot sale con una)
+function botInput(p) {
+  const out = { thr: 1, steer: 0, drift: false };
+  const car = carById(p.slot);
+  if (!G || !car || !car.alive || car.falling) return out;
+  const b = p.bot || (p.bot = { skill: rand(...BOT_PARRY_SKILL), stuck: 0, unstuck: 0, wob: rand(0, 6), tried: false });
+
+  // En el aire: alinearse con el que planea delante y hacer el parry al llegar
+  if (car.air) {
+    const tg = car.air.mode !== 'launch' ? parryTarget(car) : null;
+    if (tg) {
+      out.steer = clamp((tg.car.x - car.x) / 40, -1, 1);
+      if (!b.tried && tg.d <= PARRY_WIN * 0.7) { b.tried = true; p.botAct = Math.random() < b.skill; }
+    } else b.tried = false;
+    return out;
+  }
+  b.tried = false;
+
+  // ¿Atascado contra algo? Marcha atrás girando un momento
+  const speed = Math.hypot(car.vx, car.vy);
+  b.stuck = state === 'play' && speed < 40 ? b.stuck + 1 / 60 : 0;
+  if (b.stuck > 0.8) { b.unstuck = 0.5; b.stuck = 0; b.unDir = Math.random() < 0.5 ? -1 : 1; }
+  if (b.unstuck > 0) { b.unstuck -= 1 / 60; return { thr: -1, steer: b.unDir, drift: false }; }
+
+  // ¿A dónde ir?
+  let tx = null;
+  const g = G.curGate;
+  const li = g && g.state === 'active' ? g.lanes.findIndex((l) => l.id === car.id) : -1;
+  if (li >= 0 && car.y < g.zoneBot + 6 * T) { const [l, r] = laneBounds(g, li, car.y); tx = (l + r) / 2; }
+  const tow = G.tethers.find((t) => t.kind === 'tow' && t.a === car.id);
+  if (tow) { const tw = carById(tow.b); if (tw) tx = tw.x; } // sin motor: seguir al que remolca
+  if (tx === null) { // acercándose a una rampa con alguien planeando: alinearse para engancharlo
+    const z = jumpZoneNear(Math.floor((car.y - 4 * T) / T));
+    const gl = z && car.y > z.bot && G.cars.find((o) => o !== car && o.air && o.air.zone === z.k && o.air.mode !== 'launch');
+    if (gl) tx = gl.x;
+  }
+  if (tx === null && !car.zap) { // ayudar al del rayo embistiéndolo
+    const z = G.cars.find((o) => o !== car && o.alive && !o.falling && !o.air && o.zap && Math.hypot(o.x - car.x, o.y - car.y) < 320);
+    if (z) tx = z.x;
+  }
+  if (tx === null) tx = laneCol(Math.floor((car.y - 3 * T) / T)) * T + T / 2 + Math.sin(G.time * 0.7 + b.wob) * 10;
+
+  // Esquivar el obstáculo que tenga justo delante
+  const c = Math.floor(car.x / T);
+  for (let k = 1; k <= 3; k++) {
+    const r = Math.floor((car.y - k * T * 0.85) / T);
+    if (!isObstacle(c, r) || fallP(c, r) > 0.3) continue;
+    const leftFree = c > 0 && !isObstacle(c - 1, r), rightFree = c < COLS - 1 && !isObstacle(c + 1, r);
+    const goLeft = leftFree && (!rightFree || tx < car.x || (tx === car.x && car.x % T < T / 2));
+    tx = (c + (goLeft ? -1 : 1)) * T + T / 2;
+    break;
+  }
+
+  // Girar hacia un punto un poco por delante
+  const desired = Math.atan2(tx - car.x, 170);
+  const err = Math.atan2(Math.sin(desired - car.a), Math.cos(desired - car.a));
+  out.steer = clamp(err * 3.2, -1, 1);
+
+  // Carriles: pegado a la barrera un carro casi no gira. Si aún no está en su carril, retrocede
+  // girando hacia él; si ya está, frena antes de chocar (dentro del carril cuenta igual).
+  if (li >= 0) {
+    const [l, r] = laneBounds(g, li, car.y);
+    const inLane = car.x > l + 8 && car.x < r - 8;
+    const toBarrier = car.y - g.y;
+    if (!inLane && toBarrier < 170) {
+      // Marcha atrás con el morro inclinado hacia el lado contrario: así se desplaza hacia su
+      // carril. En reversa el volante va al revés, por eso el signo menos.
+      out.thr = -1;
+      const aim = -Math.sign(tx - car.x) * 0.6;
+      out.steer = clamp(-(aim - car.a) * 3, -1, 1);
+    } else if (inLane && toBarrier < 130) {
+      out.thr = speed > 40 ? -0.6 : 0;
+      out.steer = clamp(-car.a * 3, -1, 1); // enderezarse
+    }
+  }
+
+  // Cobrar el combo de vez en cuando
+  if (car.combo && car.combo.idle > 0.5) p.botAct = true;
+  return out;
+}
 
 // ---------------------------------------------------------------------
 //  Estado de partida
@@ -615,24 +714,32 @@ function getGate(k) {
     const r = G0 - k * GAP;
     g = {
       k, r, y: r * T + T / 2, state: 'idle', lanes: [], progress: 0, lockT: 0, openT: 0, flash: 0, lastQ: 0,
-      zoneTop: r * T + T / 2 + 10, zoneBot: (r + 1 + LANE_ROWS) * T, off: null,
+      zoneTop: r * T + T / 2 + 10, zoneBot: (r + 1 + LANE_ROWS) * T, offs: null,
     };
     G.gates.set(k, g);
   }
   return g;
 }
-// Límites del carril i (rectos y verticales). Todos miden LANE_W, van juntos y el grupo
-// empieza en g.off, una posición al azar de la pista elegida al activar el evento.
+// Límites del carril i (rectos y verticales). Todos miden LANE_W; cada uno empieza en su
+// propia posición al azar g.offs[i], elegida al activar el evento.
+const LANE_GAP = 40; // separación mínima entre carriles
 function laneBounds(g, i, y) {
-  const off = g.off != null ? g.off : (ROAD_W - g.lanes.length * LANE_W) / 2;
-  const left = off + i * LANE_W;
+  const left = g.offs && g.offs[i] != null ? g.offs[i] : (ROAD_W - g.lanes.length * LANE_W) / 2 + i * LANE_W;
   return [left, left + LANE_W];
+}
+// Posiciones al azar para n carriles separados: se reparte el espacio libre en huecos al azar
+// entre ellos (así nunca se solapan) y luego se barajan, para que el orden tampoco se repita
+function laneOffsets(n) {
+  const margin = 30, free = ROAD_W - 2 * margin - n * LANE_W - (n - 1) * LANE_GAP;
+  const cuts = Array.from({ length: n }, () => Math.random() * Math.max(0, free)).sort((a, b) => a - b);
+  const offs = cuts.map((c, i) => Math.round(margin + c + i * (LANE_W + LANE_GAP)));
+  return offs.sort(() => Math.random() - 0.5);
 }
 function assignLanes(g, cars) {
   // Orden aleatorio: obliga a cruzarse con los demás (y a empujarse)
   const order = [...cars].sort(() => Math.random() - 0.5);
   g.lanes = order.map((car) => ({ id: car.id, color: car.color, name: car.name, on: false }));
-  g.off = Math.round(rand(30, ROAD_W - g.lanes.length * LANE_W - 30));
+  g.offs = laneOffsets(g.lanes.length);
 }
 function activateGate(g) {
   const alive = liveCars();
@@ -1219,6 +1326,8 @@ function updateLobby() {
     (src) => { if (!findPlayer(src.type, src.idx)) joinPlayer(src); },
     (src) => { const p = findPlayer(src.type, src.idx); if (p) leavePlayer(p); },
   );
+  if (anyPressed(['KeyB'])) addBot();    // B: añadir un bot
+  if (anyPressed(['KeyN'])) removeBot(); // N: quitar el último bot
   if (anyPressed(['Escape']) && Net.role === 'local') { backToMenu(); return; }
   if (startPressed() && players.length) newGame();
 }
@@ -1524,7 +1633,7 @@ function sendLobby() {
   Net.broadcast({
     t: 'lobby', st: state === 'lobby' ? 'lobby' : 'game',
     players: players.map((p) => ({
-      slot: p.slot, label: p.label, act: p.act, dft: p.dft,
+      slot: p.slot, label: p.label, act: p.act, dft: p.dft, bot: p.src.type === 'bot',
       owner: p.src.type === 'net' ? p.src.peer : Net.id, lid: p.src.type === 'net' ? p.src.idx : null,
     })),
   });
@@ -1546,7 +1655,7 @@ function makeSnap(full) {
   if (full) {
     snap.gates = [...G.gates.values()].map((g) => ({
       k: g.k, state: g.state, lanes: g.lanes, progress: g.progress, lockT: g.lockT, openT: g.openT,
-      off: g.off, flash: g.flash,
+      offs: g.offs, flash: g.flash,
     }));
     snap.cg = G.curGate ? G.curGate.k : null;
     snap.th = G.tethers.map((t) => ({
@@ -1604,7 +1713,7 @@ function clientMessage(m) {
 function applyLobby(m) {
   const before = players.length;
   players.length = 0;
-  for (const q of m.players || []) players.push({ slot: q.slot, label: q.label, act: q.act, dft: q.dft, lid: q.lid, mine: q.owner === Net.id, src: null });
+  for (const q of m.players || []) players.push({ slot: q.slot, label: q.label, act: q.act, dft: q.dft, bot: !!q.bot, lid: q.lid, mine: q.owner === Net.id, src: null });
   if (players.length > before) Sound.join(players[players.length - 1].slot);
   else if (players.length < before) Sound.leave();
   if (m.st === 'lobby' && state !== 'lobby' && state !== 'menu') { state = 'lobby'; G = null; Sound.silence(); }
@@ -2636,10 +2745,10 @@ function drawLobby() {
       ctx.fillStyle = col; rr(-12, -20, 24, 40, 7); ctx.fill();
       ctx.fillStyle = 'rgba(190,230,255,0.85)'; rr(-9, -12, 18, 6, 2); ctx.fill();
       ctx.restore();
-      const where = Net.role === 'local' ? '' : isMine(p) ? ' (tú)' : ' (online)';
+      const where = isBot(p) ? ' (bot)' : Net.role === 'local' ? '' : isMine(p) ? ' (tú)' : ' (online)';
       text(`P${i + 1} · ${COLORS[i].name}${where}`, x + bw / 2, y + 125, { size: 17, color: col });
       text(p.label, x + bw / 2, y + 146, { size: 12, weight: 'normal', color: '#ccc' });
-      text(`acción ${actionLabel(p)} · derrape ${p.dft}`, x + bw / 2, y + 161, { size: 12, weight: 'normal', color: '#aaa' });
+      text(isBot(p) ? 'lo maneja la máquina' : `acción ${actionLabel(p)} · derrape ${p.dft}`, x + bw / 2, y + 161, { size: 12, weight: 'normal', color: '#aaa' });
     } else {
       text('Libre', x + bw / 2, y + h / 2, { size: 18, color: 'rgba(255,255,255,0.35)', stroke: false });
     }
@@ -2648,7 +2757,7 @@ function drawLobby() {
   const ly = H * 0.32 + 196;
   const lines = [
     'Únete pulsando ACELERAR en tu control:  W  ·  ↑  ·  I  ·  T / Num8  ·  botón A del mando',
-    'Sal pulsando FRENAR (S · ↓ · K · G · botón B)',
+    Net.role === 'client' ? 'Sal pulsando FRENAR (S · ↓ · K · G · botón B)' : 'Sal pulsando FRENAR (S · ↓ · K · G · botón B)      ·      B: añadir bot   ·   N: quitar bot',
     'Antes de cada puerta aparecen carriles de color: TODOS deben ir por el suyo a la vez para abrirla.',
     'Zona de SALTO: el primero planea sobre el abismo; el siguiente lo alcanza y pulsa ACCIÓN justo a tiempo (parry).',
     'ACCIÓN: E · Shift der. · O · Y · mando X      DERRAPE (mantener girando): Espacio · - · U · R · mando RB',
