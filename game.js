@@ -853,8 +853,14 @@ function collideObstacles(car, quiet = false) {
 //  - Quien planea demasiado sin que lo enganchen, cae.
 // ---------------------------------------------------------------------
 const playerOf = (car) => players.find((pl) => pl.slot === car.id);
-function someoneBehind(car, z) {
-  return G.cars.some((o) => o !== car && o.alive && !o.falling && !o.air && o.y > z.bot - 5);
+// ¿Queda alguien por cruzar este abismo (aparte de car y de except)? Cuenta tanto a los que
+// siguen en el suelo antes de la rampa como a los que ya están en el aire sin haber cruzado
+// (volando o planeando). Quien hace el parry se queda planeando solo si queda alguien así;
+// si no, es el último y pasa también.
+function someoneBehind(car, z, except = null) {
+  return G.cars.some((o) => o !== car && o !== except && o.alive && !o.falling && (
+    (!o.air && o.y > z.bot - 5) ||
+    (o.air && o.air.zone === z.k && o.air.mode !== 'launch')));
 }
 function startJump(car, z) {
   const speed = clamp(-car.vy, 260, CAR_MAX);
@@ -896,9 +902,11 @@ function tryParry(car, claimed = null) {
   if (d <= PARRY_WIN) {
     fx('parry', car.id, tg.car.id, d < 18);
     teamGain(d < 18 ? TEAM_PERFECT : TEAM_PARRY, d < 18 ? 'PARRY PERFECTO' : 'ENGANCHE');
+    // El que hace el parry empuja al otro al otro lado; él se queda planeando para que lo
+    // enganche el siguiente, salvo que sea el último (entonces pasa también)
     launch(tg.car);
     const z = jumpZone(car.air.zone);
-    if (someoneBehind(car, z)) { car.air.mode = 'glide'; car.air.glideT = 0; car.vy = 0; }
+    if (someoneBehind(car, z, tg.car)) { car.air.mode = 'glide'; car.air.glideT = 0; car.vy = 0; car.air.passY = null; }
     else launch(car);
   } else {
     car.parryCd = 0.6;
@@ -925,7 +933,11 @@ function flyTarget(car, a) {
 function flyStep(car, a, dt) {
   const { ty, glider } = flyTarget(car, a);
   const dist = car.y - ty; // > 0: el objetivo está delante (más arriba)
-  if (dist <= 2) { car.vy = 0; return true; }
+  if (dist <= 2) {
+    car.vy = 0;
+    if (a.passY != null) a.missed = true; // cruzó al que planeaba sin engancharlo: falló el parry
+    return true;
+  }
   // Siempre llega (ni se queda corto ni se pasa). Junto al que planea, a velocidad de cruce
   // fija: así la ventana del parry dura lo mismo sin importar cómo se saltó.
   const nearGlider = glider ? car.y - glider.y < 220 : a.passY != null && car.y - a.passY < FLY_PASS + 60;
@@ -959,6 +971,9 @@ function updateAir(car, dt, inp, p) {
     car.vy *= Math.exp(-4 * dt);
     if (car.y < a.top + 40) { car.y = a.top + 40; car.vy = 0; }
     a.z = 0.6 + 0.06 * Math.sin(G.time * 5);
+    // Si ya no queda nadie por cruzar (los demás pasaron o cayeron), el último pasa solo.
+    // No vale si se llegó aquí fallando el parry: entonces hay que esperar o caer.
+    if (!a.missed && !someoneBehind(car, jumpZone(a.zone))) { launch(car); return; }
     // El tiempo se pausa mientras alguien ya vuela hacia mí (que no se acabe en su cara)
     const incoming = G.cars.some((o) => o !== car && o.alive && !o.falling && o.air && o.air.zone === a.zone &&
       o.air.mode === 'fly' && o.y > car.y);
