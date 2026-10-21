@@ -12,6 +12,9 @@ Estado: ✅ hecho · 🚧 en curso · 💡 idea
 - ✅ Barra de sinergia compartida → TURBO en equipo con efecto de velocidad
 - ✅ Indicador de distancia al colapso (número, minimapa y aviso rojo con latido)
 - ✅ Multijugador local y online (PeerJS)
+- ✅ Bots (B/N en el lobby) que juegan todos los eventos
+- ✅ Revivir: piezas en la pista; con 4 vuelven los caídos (2 s invulnerables)
+- 📄 Documento completo para la migración a 3D: [GDD.md](GDD.md)
 
 ## Derrape y trucos
 - ✅ **Derrape**: mantener un botón al girar para patinar. Al soltar, mini-turbo según lo largo del derrape (nivel azul / naranja).

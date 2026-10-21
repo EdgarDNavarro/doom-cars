@@ -41,6 +41,7 @@ En el lobby, el host (o el modo local) puede añadir **bots** con **B** y quitar
 - **Cuerda**: dos carros atados 15 s; se traban en los obstáculos.
 - **Remolque**: un carro sin motor debe ser jalado hasta la línea de recarga.
 - **Derrape y combos**: derrapes, pasadas al límite, roces y aterrizajes suben el multiplicador; ACCIÓN cobra el combo.
+- **Revivir**: si alguien cae, aparecen piezas de carro en la pista; al recoger 4 entre todos, los caídos vuelven con 2 s de invulnerabilidad.
 - **Sinergia**: los eventos bien hechos llenan una barra compartida que activa el **TURBO** para todos.
 
 ## Archivos

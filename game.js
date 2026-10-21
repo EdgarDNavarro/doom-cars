@@ -61,6 +61,12 @@ const TOW_EVERY = [38, 55];
 const TOW_LEN = 95, TOW_MAX = 170, TOW_K = 14;
 const TOW_DIST = 1100;        // distancia hasta la línea de recarga (px; 16 px = 1 m)
 const TEAM_ROPE = 0.15, TEAM_TOW = 0.2; // sinergia por sobrevivir atados / completar el remolque
+// Revivir: mientras haya muertos aparecen piezas; al juntar PARTS_NEEDED reviven todos
+const PARTS_NEEDED = 4;        // piezas (compartidas) para revivir a los muertos
+const PART_EVERY = [1.6, 2.8]; // cada cuántos segundos aparece una pieza
+const MAX_PARTS = 3;           // piezas a la vez en la pista
+const PART_PICK_R = 34;        // distancia para recogerla
+const REVIVE_GHOST = 2;        // segundos de invulnerabilidad al revivir
 // Derrape y combos
 const DRIFT_MIN_SPEED = 140;    // velocidad mínima para empezar a derrapar
 const DRIFT_LEVELS = [1.1, 2.4]; // segundos de derrape para el nivel 1 (azul) y 2 (naranja)
@@ -231,6 +237,11 @@ const Sound = {
   rope() { this.tone(220, 0.25, { type: 'triangle', vol: 0.15, to: 330 }); this.noise(0.3, { vol: 0.15, freq: 900, type: 'bandpass' }); },
   snag() { this.tone(140, 0.25, { type: 'square', vol: 0.12, to: 90 }); this.noise(0.15, { vol: 0.2, freq: 500 }); },
   snap() { this.noise(0.12, { vol: 0.3, freq: 3500, type: 'highpass' }); this.tone(900, 0.1, { type: 'triangle', vol: 0.1, to: 400 }); },
+  part() { this.tone(900, 0.08, { type: 'square', vol: 0.1, to: 1500 }); this.tone(1500, 0.1, { type: 'triangle', vol: 0.08, delay: 0.06 }); },
+  revive() {
+    [392, 523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.22, { delay: i * 0.08, vol: 0.12, type: 'triangle' }));
+    this.noise(0.5, { vol: 0.15, freq: 2000, type: 'highpass' });
+  },
   engineDie() { this.tone(260, 0.8, { type: 'sawtooth', vol: 0.12, to: 35 }); this.noise(0.4, { vol: 0.12, freq: 300 }); },
   gameOver() { [392, 330, 262, 196].forEach((f, i) => this.tone(f, 0.35, { delay: i * 0.22, vol: 0.12, type: 'sawtooth' })); },
 };
@@ -350,16 +361,19 @@ function botInput(p) {
   if (!G || !car || !car.alive || car.falling) return out;
   const b = p.bot || (p.bot = { skill: rand(...BOT_PARRY_SKILL), stuck: 0, unstuck: 0, wob: rand(0, 6), tried: false });
 
-  // En el aire: alinearse con el que planea delante y hacer el parry al llegar
+  // En el aire: acercarse de lado al que planea (todos a la misma altura) y hacer el parry
   if (car.air) {
-    const tg = car.air.mode !== 'launch' ? parryTarget(car) : null;
-    if (tg) {
-      out.steer = clamp((tg.car.x - car.x) / 40, -1, 1);
-      if (!b.tried && tg.d <= PARRY_WIN * 0.7) { b.tried = true; p.botAct = Math.random() < b.skill; }
-    } else b.tried = false;
+    if (car.air.mode === 'launch') return out;
+    const gl = nearestGlider(car, car.air);
+    if (gl) {
+      out.steer = clamp((gl.x - car.x) / 40, -1, 1);
+      const tg = parryTarget(car);
+      b.tryT = (b.tryT || 0) - 1 / 60;
+      if (tg && tg.d <= PARRY_WIN * 0.7 && b.tryT <= 0) { b.tryT = 0.8; p.botAct = Math.random() < b.skill; }
+    }
     return out;
   }
-  b.tried = false;
+  b.tryT = 0;
 
   // ¿Atascado contra algo? Marcha atrás girando un momento
   const speed = Math.hypot(car.vx, car.vy);
@@ -370,7 +384,8 @@ function botInput(p) {
   // ¿A dónde ir?
   let tx = null;
   const g = G.curGate;
-  const li = g && g.state === 'active' ? g.lanes.findIndex((l) => l.id === car.id) : -1;
+  // (solo si aún no pasó la barrera: más allá ya no hay carril que buscar)
+  const li = g && g.state === 'active' && car.y > g.y ? g.lanes.findIndex((l) => l.id === car.id) : -1;
   if (li >= 0 && car.y < g.zoneBot + 6 * T) { const [l, r] = laneBounds(g, li, car.y); tx = (l + r) / 2; }
   const tow = G.tethers.find((t) => t.kind === 'tow' && t.a === car.id);
   if (tow) { const tw = carById(tow.b); if (tw) tx = tw.x; } // sin motor: seguir al que remolca
@@ -378,6 +393,10 @@ function botInput(p) {
     const z = jumpZoneNear(Math.floor((car.y - 4 * T) / T));
     const gl = z && car.y > z.bot && G.cars.find((o) => o !== car && o.air && o.air.zone === z.k && o.air.mode !== 'launch');
     if (gl) tx = gl.x;
+  }
+  if (tx === null && G.parts.length) { // recoger piezas para revivir a los caídos
+    const part = G.parts.find((q) => q.y < car.y - 30 && car.y - q.y < 420 && Math.abs(q.x - car.x) < 320);
+    if (part) tx = part.x;
   }
   if (tx === null && !car.zap) { // ayudar al del rayo embistiéndolo
     const z = G.cars.find((o) => o !== car && o.alive && !o.falling && !o.air && o.zap && Math.hypot(o.x - car.x, o.y - car.y) < 320);
@@ -442,6 +461,7 @@ function makeWorld(seed) {
     team: 0, turbo: 0, teamPop: null,
     pops: [], screechT: 0,
     tethers: [], ropeT: rand(ROPE_EVERY[0], ROPE_EVERY[1]), towT: rand(TOW_EVERY[0], TOW_EVERY[1]),
+    parts: [], partCount: 0, partT: 1, partId: 0,
   };
 }
 function makeCar(id, x, y) {
@@ -451,7 +471,7 @@ function makeCar(id, x, y) {
     alive: true, falling: false, fallT: 0, slide: 0, dist: 0, thr: 0, deathTime: 0, reason: '',
     air: null, parryCd: 0, zap: null,
     drift: null, slip: 0, combo: null, score: 0, boostT: 0, boostV: 0, grazeCd: 0, nearCd: 0,
-    noEngine: false,
+    noEngine: false, ghost: 0,
   };
 }
 function newGame() {
@@ -570,6 +590,19 @@ const FX = {
     const c = carById(id);
     Sound.cash();
     if (c) { addPop(c.x, c.y - 80, `+${value}`, '#ffd23f', 26); burst(c.x, c.y, '#ffd23f', 16, 200); }
+  },
+  partPick(x, y, count) {
+    Sound.part();
+    burst(x, y, '#ffb347', 14, 180);
+    addPop(x, y - 30, `+1 pieza (${count}/${PARTS_NEEDED})`, '#ffb347', 15);
+  },
+  revive(ids) {
+    const cars = ids.map(carById).filter(Boolean);
+    Sound.revive();
+    G.flash = Math.max(G.flash, 0.3);
+    for (const c of cars) { burst(c.x, c.y, c.color, 30, 260); burst(c.x, c.y, '#ffffff', 12, 160); }
+    const names = cars.map((c) => c.name).join(' y ');
+    setMsg(`¡${names} ${cars.length > 1 ? 'REVIVIERON' : 'REVIVIÓ'}!`, '#ffb347', 1.8);
   },
   ropeOn(a, b) {
     const ca = carById(a), cb = carById(b);
@@ -906,52 +939,46 @@ function tryParry(car, claimed = null) {
     // enganche el siguiente, salvo que sea el último (entonces pasa también)
     launch(tg.car);
     const z = jumpZone(car.air.zone);
-    if (someoneBehind(car, z, tg.car)) { car.air.mode = 'glide'; car.air.glideT = 0; car.vy = 0; car.air.passY = null; }
+    if (someoneBehind(car, z, tg.car)) { car.air.mode = 'glide'; car.air.glideT = 0; car.vy = 0; }
     else launch(car);
   } else {
     car.parryCd = 0.6;
     fx('whiff');
   }
 }
-// Vuelo sobre el abismo. No depende de la velocidad con la que se pasó la rampa:
-//  - si alguien planea delante, se vuela hacia él y se le cruza un poco (siempre se pasa por
-//    la zona del parry) y una ayuda lateral suave va alineando;
-//  - si no, se vuela hasta un punto fijo a mitad del abismo y ahí se planea.
-// Devuelve true al llegar (empieza a planear).
-const GLIDE_POINT = 0.55; // dónde planea el primero (fracción del abismo desde la rampa)
-const FLY_PASS = 70;      // cuánto se pasa al que planea delante
-const PASS_SPEED = 130;   // velocidad al cruzar junto al que planea (≈0,4 s de ventana de parry)
-function flyTarget(car, a) {
-  const glider = G.cars.find((o) => o !== car && o.alive && !o.falling && o.air && o.air.zone === a.zone &&
-    o.air.mode === 'glide' && o.y < car.y);
-  // Al ver a alguien planeando delante se fija el objetivo "un poco más allá de él" y se
-  // mantiene aunque ya se le haya cruzado (si no, se quedaría parado encima)
-  if (glider) a.passY = glider.y - FLY_PASS;
-  const ty = a.passY != null ? a.passY : a.bot - (a.bot - a.top) * GLIDE_POINT;
-  return { ty: Math.max(a.top + 40, ty), glider };
-}
-function flyStep(car, a, dt) {
-  const { ty, glider } = flyTarget(car, a);
-  const dist = car.y - ty; // > 0: el objetivo está delante (más arriba)
-  if (dist <= 2) {
-    car.vy = 0;
-    if (a.passY != null) a.missed = true; // cruzó al que planeaba sin engancharlo: falló el parry
-    return true;
+// Vuelo sobre el abismo: TODOS van a la misma línea de planeo (a mitad del abismo) y se
+// quedan ahí a la misma altura, sin importar la velocidad con la que pasaron la rampa.
+// El parry se hace acercándose de lado al que planea. Mientras se vuela hacia la línea, una
+// ayuda suave va acercando al carro hacia el que espera.
+const GLIDE_POINT = 0.55; // dónde está la línea de planeo (fracción del abismo desde la rampa)
+const AIR_STEER = 260;    // velocidad lateral en el aire (para poder acercarse de lado)
+const glideLine = (a) => a.bot - (a.bot - a.top) * GLIDE_POINT;
+function nearestGlider(car, a) {
+  let best = null, bd = Infinity;
+  for (const o of G.cars) {
+    if (o === car || !o.alive || o.falling || !o.air || o.air.zone !== a.zone || o.air.mode !== 'glide') continue;
+    const d = Math.abs(o.x - car.x);
+    if (d < bd) { best = o; bd = d; }
   }
-  // Siempre llega (ni se queda corto ni se pasa). Junto al que planea, a velocidad de cruce
-  // fija: así la ventana del parry dura lo mismo sin importar cómo se saltó.
-  const nearGlider = glider ? car.y - glider.y < 220 : a.passY != null && car.y - a.passY < FLY_PASS + 60;
-  const want = nearGlider ? -Math.min(PASS_SPEED, Math.max(70, dist * 3)) : -clamp(dist * 2.2, 90, 420);
+  return best;
+}
+// Devuelve true al llegar a la línea (empieza a planear)
+function flyStep(car, a, dt) {
+  const ty = glideLine(a);
+  const dist = car.y - ty; // > 0: la línea está delante (más arriba)
+  if (dist <= 2) { car.y = ty; car.vy = 0; return true; }
+  const want = -clamp(dist * 2.5, 80, 420); // llega siempre, frenando al final
   car.vy += (want - car.vy) * Math.min(1, dt * 9);
   car.y = Math.max(ty, car.y + car.vy * dt);
-  if (glider) car.x += (glider.x - car.x) * Math.min(1, dt * 1.5); // ayuda para alinearse
+  const gl = nearestGlider(car, a);
+  if (gl) car.x += (gl.x - car.x) * Math.min(1, dt * 1.5); // ayuda para alinearse
   return false;
 }
 
 function updateAir(car, dt, inp, p) {
   const a = car.air;
   a.t += dt;
-  car.x = clamp(car.x + inp.steer * 170 * dt, CAR_R, ROAD_W - CAR_R);
+  car.x = clamp(car.x + inp.steer * (a.mode === 'launch' ? 170 : AIR_STEER) * dt, CAR_R, ROAD_W - CAR_R);
   if (a.mode === 'launch') {
     const k = Math.min(1, a.t / 0.75);
     car.y = a.fromY + (a.toY - a.fromY) * easeOut(k);
@@ -967,9 +994,9 @@ function updateAir(car, dt, inp, p) {
     if (flyStep(car, a, dt)) { a.mode = 'glide'; a.glideT = 0; }
     a.z = 0.6 + 0.4 * Math.exp(-a.t * 2);
   } else {
-    car.y += car.vy * dt;
-    car.vy *= Math.exp(-4 * dt);
-    if (car.y < a.top + 40) { car.y = a.top + 40; car.vy = 0; }
+    // Planeando: siempre en la línea, a la misma altura que los demás
+    car.y += (glideLine(a) - car.y) * Math.min(1, dt * 10);
+    car.vy = 0;
     a.z = 0.6 + 0.06 * Math.sin(G.time * 5);
     // Si ya no queda nadie por cruzar (los demás pasaron o cayeron), el último pasa solo.
     // No vale si se llegó aquí fallando el parry: entonces hay que esperar o caer.
@@ -980,7 +1007,12 @@ function updateAir(car, dt, inp, p) {
     if (!incoming) a.glideT += dt;
     const left = GLIDE_TIME - a.glideT;
     if (left < 1.2 && a.glideT - a.lastBeep > (left < 0.5 ? 0.1 : 0.22)) { a.lastBeep = a.glideT; fx('warn'); }
-    if (left <= 0) { killCar(car, 'no lo engancharon'); return; }
+    if (left <= 0) {
+      // Quienes planeaban a su lado no lo salvaron: tampoco pasan solos por quedarse los últimos
+      for (const o of G.cars) if (o !== car && o.air && o.air.zone === a.zone && o.air.mode === 'glide') o.air.missed = true;
+      killCar(car, 'no lo engancharon');
+      return;
+    }
   }
   const act = takeAction(p);
   if (act) tryParry(car, act.d);
@@ -1156,6 +1188,66 @@ function updateTethers(dt) {
   }
 }
 
+// ---------------------------------------------------------------------
+//  Revivir: mientras haya alguien muerto aparecen piezas de carro por delante del grupo.
+//  Los vivos las recogen pasando por encima (el contador es compartido) y al juntar
+//  PARTS_NEEDED reviven todos los muertos junto al grupo, con unos segundos de
+//  invulnerabilidad (atraviesan obstáculos y carros, y no caen).
+// ---------------------------------------------------------------------
+const deadCars = () => G.cars.filter((c) => !c.alive && !c.falling);
+function freeSpot(x, y) {
+  const c = Math.floor(x / T), r = Math.floor(y / T);
+  return c >= 0 && c < COLS && !isObstacle(c, r) && !isChasm(r) && !isRamp(r) && gateZone(r) !== 'barrier' && fallP(c, r) <= 0;
+}
+function updateParts(dt) {
+  const live = liveCars();
+  G.parts = G.parts.filter((p) => G.doomY > p.y + 40); // las que se tragó el colapso
+  if (!deadCars().length || !live.length) { G.parts.length = 0; G.partCount = 0; return; }
+
+  // Aparecer por delante del que va primero
+  G.partT -= dt;
+  if (G.partT <= 0 && G.parts.length < MAX_PARTS) {
+    G.partT = rand(PART_EVERY[0], PART_EVERY[1]);
+    const lead = Math.min(...live.map((c) => c.y));
+    for (let i = 0; i < 12; i++) {
+      const x = rand(60, ROAD_W - 60), y = lead - rand(220, 520);
+      if (freeSpot(x, y)) { G.parts.push({ id: ++G.partId, x: Math.round(x), y: Math.round(y) }); break; }
+    }
+  }
+
+  // Recoger
+  for (const car of live) {
+    if (car.air) continue;
+    for (let i = G.parts.length - 1; i >= 0; i--) {
+      const p = G.parts[i];
+      if (Math.hypot(p.x - car.x, p.y - car.y) > PART_PICK_R) continue;
+      G.parts.splice(i, 1);
+      G.partCount = Math.min(PARTS_NEEDED, G.partCount + 1);
+      fx('partPick', p.x, p.y, G.partCount, car.id);
+    }
+  }
+  if (G.partCount >= PARTS_NEEDED) reviveAll();
+}
+function reviveAll() {
+  // Reaparecen junto al primero que esté en el suelo (si todos vuelan, se espera a que aterricen)
+  const ground = liveCars().filter((c) => !c.air);
+  if (!ground.length) return;
+  const anchor = ground.reduce((a, b) => (b.y < a.y ? b : a));
+  const dead = deadCars();
+  dead.forEach((c, i) => {
+    const side = i % 2 ? 1 : -1, step = Math.ceil((i + 1) / 2);
+    Object.assign(c, {
+      alive: true, falling: false, fallT: 0, reason: '',
+      x: clamp(anchor.x + side * step * 60, CAR_R + 10, ROAD_W - CAR_R - 10), y: anchor.y + 70,
+      vx: 0, vy: Math.min(0, anchor.vy), a: 0, slip: 0, slide: 0,
+      air: null, zap: null, drift: null, combo: null, noEngine: false, boostT: 0,
+      ghost: REVIVE_GHOST,
+    });
+  });
+  G.partCount = 0; G.parts.length = 0;
+  fx('revive', dead.map((c) => c.id));
+}
+
 // Física de conducción: acelerar, girar, moverse y chocar con bordes, obstáculos y barreras.
 // La usan el host (quiet=false) y la predicción local del cliente (quiet=true: solo mueve,
 // sin efectos ni combos, porque eso lo decide el host).
@@ -1181,7 +1273,7 @@ function drive(car, dt, thr, steer, fwd, lat, maxF, boost, quiet) {
   if (car.x < CAR_R) { car.x = CAR_R; if (car.vx < -120) hit(car.x - CAR_R, car.y, 6, 0); car.vx = Math.abs(car.vx) * 0.4; }
   if (car.x > ROAD_W - CAR_R) { car.x = ROAD_W - CAR_R; if (car.vx > 120) hit(car.x + CAR_R, car.y, 6, 0); car.vx = -Math.abs(car.vx) * 0.4; }
 
-  collideObstacles(car, quiet);
+  if (!(car.ghost > 0)) collideObstacles(car, quiet); // recién revivido: atraviesa obstáculos
 
   // Barreras de las puertas cerradas
   for (const g of G.gates.values()) {
@@ -1213,6 +1305,7 @@ function updateCar(car, dt) {
   car.grazeCd = Math.max(0, car.grazeCd - dt);
   car.nearCd = Math.max(0, car.nearCd - dt);
   car.boostT = Math.max(0, car.boostT - dt);
+  car.ghost = Math.max(0, (car.ghost || 0) - dt);
   if (car.air) { car.drift = null; car.slip *= Math.exp(-8 * dt); updateAir(car, dt, inp, p); return; }
   // En el suelo, ACCIÓN cobra el combo
   if (takeAction(p) && car.combo) cashCombo(car);
@@ -1277,7 +1370,7 @@ function updateCar(car, dt) {
   if (z && prevY >= z.bot && car.y < z.bot) { startJump(car, z); return; }
 
   // ¿Se cayó el suelo debajo (o entró al abismo sin saltar)?
-  if (state === 'play') {
+  if (state === 'play' && !(car.ghost > 0)) { // recién revivido: no cae
     const c = clamp(Math.floor(car.x / T), 0, COLS - 1), r = Math.floor(car.y / T);
     if (isChasm(r)) killCar(car, 'cayó al abismo');
     else if (fallP(c, r) > 0.25) killCar(car, 'cayó al vacío');
@@ -1285,7 +1378,7 @@ function updateCar(car, dt) {
 }
 
 function collideCars() {
-  const cs = liveCars().filter((c) => !c.air);
+  const cs = liveCars().filter((c) => !c.air && !(c.ghost > 0)); // los recién revividos atraviesan
   for (let i = 0; i < cs.length; i++) for (let j = i + 1; j < cs.length; j++) {
     const a = cs[i], b = cs[j];
     const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy), min = CAR_R * 2;
@@ -1342,7 +1435,7 @@ function updateCamera(dt, viewOnly = false) {
   const bottom = G.camY + viewH / 2;
   for (const c of live) {
     if (c.air) continue;
-    if (state === 'play' && !jumping && c.y > bottom + 30) killCar(c, 'se quedó atrás');
+    if (state === 'play' && !jumping && !(c.ghost > 0) && c.y > bottom + 30) killCar(c, 'se quedó atrás');
   }
 }
 
@@ -1426,6 +1519,7 @@ function simulate(dt) {
   }
 
   for (const car of G.cars) updateCar(car, dt);
+  if (state === 'play') updateParts(dt);
   updateTethers(dt);
   collideCars();
   updateGates(dt);
@@ -1617,7 +1711,7 @@ function startLocalAir(c, z) {
 function localAirStep(c, dt, inp) {
   const la = c.localAir;
   la.t += dt;
-  c.x = clamp(c.x + inp.steer * 170 * dt, CAR_R, ROAD_W - CAR_R);
+  c.x = clamp(c.x + inp.steer * (la.solo ? 170 : AIR_STEER) * dt, CAR_R, ROAD_W - CAR_R);
   if (la.solo) {
     const k = Math.min(1, la.t / 0.75);
     c.y = la.fromY + (la.toY - la.fromY) * easeOut(k);
@@ -1691,13 +1785,13 @@ function sendLobby() {
 // full: incluye puertas y cuerdas (cambian poco). Los carros van en todos.
 function makeSnap(full) {
   const snap = {
-    t: 's', seq: ++NET.seq, st: state, cd: countdown, ot: overT, seed: G.seed, time: G.time,
+    t: 's', seq: ++NET.seq, st: state, cd: countdown, ot: overT, seed: G.seed, time: G.time, pc: G.partCount,
     doomY: r1(G.doomY), ds: G.doomSpeed, best: G.best, tm: G.team, tb: G.turbo,
     cars: G.cars.map((c) => ({
       id: c.id, x: r1(c.x), y: r1(c.y), a: Math.round(c.a * 1000) / 1000, vx: r1(c.vx), vy: r1(c.vy),
       al: c.alive, fa: c.falling, ft: c.fallT, th: c.thr, di: c.dist, dt: c.deathTime, re: c.reason, air: c.air, cd: c.parryCd,
       zp: c.zap ? { t: r1(c.zap.t), side: c.zap.side } : null,
-      dr: c.drift, sl: Math.round(c.slip * 100) / 100, sc: c.score, ne: c.noEngine,
+      dr: c.drift, sl: Math.round(c.slip * 100) / 100, sc: c.score, ne: c.noEngine, gh: r1(c.ghost || 0),
       cb: c.combo ? { pts: Math.round(c.combo.pts), mult: c.combo.mult, idle: r1(c.combo.idle) } : null,
     })),
   };
@@ -1707,6 +1801,7 @@ function makeSnap(full) {
       offs: g.offs, flash: g.flash,
     }));
     snap.cg = G.curGate ? G.curGate.k : null;
+    snap.pl = G.parts;
     snap.th = G.tethers.map((t) => ({
       kind: t.kind, a: t.a, b: t.b, time: r1(t.time), L: r1(t.L), rest: t.rest, max: t.max, k: t.k,
       slack: t.slack, goalY: t.goalY, snag: t.snag ? { x: t.snag.x, y: t.snag.y } : null,
@@ -1783,13 +1878,15 @@ function applySnap(m) {
   state = m.st; countdown = m.cd; overT = m.ot;
   G.time = m.time; G.doomY = m.doomY; G.doomSpeed = m.ds; G.best = m.best;
   G.team = m.tm || 0; G.turbo = m.tb || 0;
+  G.partCount = m.pc || 0;
+  if (m.pl) G.parts = m.pl;
   const now = performance.now();
   for (const s of m.cars) {
     let c = carById(s.id);
     if (!c) { c = makeCar(s.id, s.x, s.y); c.a = s.a; G.cars.push(c); }
     Object.assign(c, {
       alive: s.al, falling: s.fa, fallT: s.ft, thr: s.th, dist: s.di, deathTime: s.dt, reason: s.re, air: s.air, parryCd: s.cd, zap: s.zp,
-      combo: s.cb, score: s.sc || 0, noEngine: !!s.ne,
+      combo: s.cb, score: s.sc || 0, noEngine: !!s.ne, ghost: s.gh || 0,
       tx: s.x, ty: s.y, ta: s.a, tvx: s.vx, tvy: s.vy, recv: now,
     });
     // Mi carro en el suelo lo mueve la predicción local. Lo que manda el host refleja mis
@@ -2291,6 +2388,7 @@ function drawCar(car) {
   ctx.rotate(car.a + (car.slip || 0) + (car.falling ? car.fallT * 5 : 0));
   ctx.scale(s * (air ? 1 + air.z * 0.35 : 1), s * (air ? 1 + air.z * 0.35 : 1));
   if (car.falling) ctx.globalAlpha = 1 - car.fallT * 0.5;
+  else if (car.ghost > 0) ctx.globalAlpha = 0.35 + 0.35 * Math.abs(Math.sin(performance.now() / 70)); // invulnerable
   if (!car.falling && !air) { ctx.fillStyle = 'rgba(0,0,0,0.4)'; rr(-9, -15, 26, 40, 7); ctx.fill(); }
   ctx.fillStyle = '#111';
   for (const [wx, wy] of [[-15, -15], [11, -15], [-15, 5], [11, 5]]) ctx.fillRect(wx, wy, 4, 11);
@@ -2407,6 +2505,45 @@ function drawTethers() {
   }
 }
 
+// Piezas de carro para revivir: engranajes que giran y brillan
+function drawParts() {
+  const t = performance.now() / 1000;
+  for (const p of G.parts) {
+    const bob = Math.sin(t * 4 + p.id) * 3;
+    ctx.save();
+    ctx.translate(p.x, p.y + bob);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(4, 10 - bob, 15, 6, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowColor = '#ffb347'; ctx.shadowBlur = 14 + 6 * Math.sin(t * 6 + p.id);
+    ctx.rotate(t * 2 + p.id);
+    ctx.fillStyle = '#c9ccd8';
+    ctx.beginPath();
+    for (let i = 0; i < 16; i++) {
+      const r = i % 2 ? 11 : 15, an = (i / 16) * Math.PI * 2;
+      i ? ctx.lineTo(Math.cos(an) * r, Math.sin(an) * r) : ctx.moveTo(Math.cos(an) * r, Math.sin(an) * r);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffb347'; ctx.beginPath(); ctx.arc(0, 0, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#2a2c3b'; ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// Contador de piezas (solo si hay alguien muerto), encima de la barra de sinergia
+function drawPartsHud() {
+  if (!G.cars.some((c) => !c.alive && !c.falling) || state !== 'play') return;
+  const by = H - (Net.role === 'local' ? 34 : 78) - 46;
+  const n = PARTS_NEEDED, sz = 18, gap = 8, w = n * sz + (n - 1) * gap;
+  text('PIEZAS PARA REVIVIR', W / 2, by - 16, { size: 12, color: '#ffb347' });
+  for (let i = 0; i < n; i++) {
+    const x = W / 2 - w / 2 + i * (sz + gap) + sz / 2;
+    ctx.fillStyle = i < G.partCount ? '#ffb347' : 'rgba(255,255,255,0.15)';
+    ctx.beginPath(); ctx.arc(x, by, sz / 2, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 2; ctx.stroke();
+  }
+}
+
 function drawPops() {
   for (const p of G.pops) {
     const k = p.t / p.max;
@@ -2489,6 +2626,7 @@ function drawWorld() {
 
   drawChasmEdges(r0, r1);
   drawParticles();
+  drawParts();
   drawTethers();
   for (const car of G.cars) if (!car.air) drawCar(car);
   for (const g of G.gates.values()) drawGateBarrier(g);
@@ -2665,6 +2803,7 @@ function drawHUD() {
   }
 
   if (state !== 'countdown') drawTeamBar();
+  drawPartsHud();
 
   if (G.msg) {
     const k = G.msg.t / G.msg.max;
@@ -2813,6 +2952,7 @@ function drawLobby() {
     'COMBOS: derrapa, pasa rozando carros y obstáculos, aterriza saltos. ACCIÓN en el suelo cobra; chocar lo pierde.',
     'RAYO: a quien le cae va más lento y gira mal hacia un lado. ¡Chóquenlo para repararlo!',
     'CUERDA: a veces dos quedan atados 15 s (ojo con los obstáculos). REMOLQUE: jala al que no tiene motor hasta la recarga.',
+    'REVIVIR: si alguien cae, aparecen piezas en la pista; recojan 4 entre todos y los caídos vuelven.',
     'Carriles, enganches y reparaciones llenan la barra de SINERGIA: llena = ¡TURBO para todos!',
   ];
   lines.forEach((l, i) => text(l, W / 2, ly + i * 21, { size: 13, weight: 'normal', color: i < 2 ? '#eee' : '#bbb' }));
