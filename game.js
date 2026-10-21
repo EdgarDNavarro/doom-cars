@@ -905,6 +905,37 @@ function tryParry(car, claimed = null) {
     fx('whiff');
   }
 }
+// Vuelo sobre el abismo. No depende de la velocidad con la que se pasó la rampa:
+//  - si alguien planea delante, se vuela hacia él y se le cruza un poco (siempre se pasa por
+//    la zona del parry) y una ayuda lateral suave va alineando;
+//  - si no, se vuela hasta un punto fijo a mitad del abismo y ahí se planea.
+// Devuelve true al llegar (empieza a planear).
+const GLIDE_POINT = 0.55; // dónde planea el primero (fracción del abismo desde la rampa)
+const FLY_PASS = 70;      // cuánto se pasa al que planea delante
+const PASS_SPEED = 130;   // velocidad al cruzar junto al que planea (≈0,4 s de ventana de parry)
+function flyTarget(car, a) {
+  const glider = G.cars.find((o) => o !== car && o.alive && !o.falling && o.air && o.air.zone === a.zone &&
+    o.air.mode === 'glide' && o.y < car.y);
+  // Al ver a alguien planeando delante se fija el objetivo "un poco más allá de él" y se
+  // mantiene aunque ya se le haya cruzado (si no, se quedaría parado encima)
+  if (glider) a.passY = glider.y - FLY_PASS;
+  const ty = a.passY != null ? a.passY : a.bot - (a.bot - a.top) * GLIDE_POINT;
+  return { ty: Math.max(a.top + 40, ty), glider };
+}
+function flyStep(car, a, dt) {
+  const { ty, glider } = flyTarget(car, a);
+  const dist = car.y - ty; // > 0: el objetivo está delante (más arriba)
+  if (dist <= 2) { car.vy = 0; return true; }
+  // Siempre llega (ni se queda corto ni se pasa). Junto al que planea, a velocidad de cruce
+  // fija: así la ventana del parry dura lo mismo sin importar cómo se saltó.
+  const nearGlider = glider ? car.y - glider.y < 220 : a.passY != null && car.y - a.passY < FLY_PASS + 60;
+  const want = nearGlider ? -Math.min(PASS_SPEED, Math.max(70, dist * 3)) : -clamp(dist * 2.2, 90, 420);
+  car.vy += (want - car.vy) * Math.min(1, dt * 9);
+  car.y = Math.max(ty, car.y + car.vy * dt);
+  if (glider) car.x += (glider.x - car.x) * Math.min(1, dt * 1.5); // ayuda para alinearse
+  return false;
+}
+
 function updateAir(car, dt, inp, p) {
   const a = car.air;
   a.t += dt;
@@ -920,15 +951,18 @@ function updateAir(car, dt, inp, p) {
     }
     return;
   }
-  car.y += car.vy * dt;
-  car.vy *= Math.exp(-(a.mode === 'glide' ? 4 : 1.2) * dt);
-  if (car.y < a.top + 40) { car.y = a.top + 40; car.vy = 0; }
   if (a.mode === 'fly') {
+    if (flyStep(car, a, dt)) { a.mode = 'glide'; a.glideT = 0; }
     a.z = 0.6 + 0.4 * Math.exp(-a.t * 2);
-    if (Math.abs(car.vy) < 40) { a.mode = 'glide'; a.glideT = 0; }
   } else {
+    car.y += car.vy * dt;
+    car.vy *= Math.exp(-4 * dt);
+    if (car.y < a.top + 40) { car.y = a.top + 40; car.vy = 0; }
     a.z = 0.6 + 0.06 * Math.sin(G.time * 5);
-    a.glideT += dt;
+    // El tiempo se pausa mientras alguien ya vuela hacia mí (que no se acabe en su cara)
+    const incoming = G.cars.some((o) => o !== car && o.alive && !o.falling && o.air && o.air.zone === a.zone &&
+      o.air.mode === 'fly' && o.y > car.y);
+    if (!incoming) a.glideT += dt;
     const left = GLIDE_TIME - a.glideT;
     if (left < 1.2 && a.glideT - a.lastBeep > (left < 0.5 ? 0.1 : 0.22)) { a.lastBeep = a.glideT; fx('warn'); }
     if (left <= 0) { killCar(car, 'no lo engancharon'); return; }
@@ -1579,9 +1613,9 @@ function localAirStep(c, dt, inp) {
       return;
     }
   } else {
-    c.y += la.vy * dt;
-    la.vy *= Math.exp(-1.2 * dt);
-    if (c.y < la.top + 40) { c.y = la.top + 40; la.vy = 0; }
+    c.vy = la.vy;
+    flyStep(c, c.air, dt); // mismo vuelo que en el host
+    la.vy = c.vy;
     c.air.z = 0.6 + 0.4 * Math.exp(-la.t * 2);
   }
   c.vy = la.vy; c.vx = 0;
