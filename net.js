@@ -82,6 +82,10 @@ const Net = {
   // mandan muy seguido: si se pierde uno, no se espera a reenviarlo, ya llega el siguiente.
   // Es un segundo canal "pactado" (mismo id en los dos lados) sobre la misma conexión.
   FAST_ID: 1001,
+  // Si el canal ya tiene esto pendiente de salir, la conexión no da abasto: el mensaje se
+  // descarta en vez de encolarse (si no, el retraso crece sin parar: 1 s, 2 s, 4 s…)
+  FAST_MAX_BUFFER: 1500, // ≈ 2-3 mensajes de estado
+  drops: 0, // mensajes descartados por conexión saturada (para avisar en pantalla)
   attachFast(conn, from) {
     try {
       const ch = conn.peerConnection.createDataChannel('rapido', { negotiated: true, id: this.FAST_ID, ordered: false, maxRetransmits: 0 });
@@ -94,21 +98,23 @@ const Net = {
     } catch (err) { conn.fast = null; } // sin canal rápido: todo va por el fiable
   },
   fastOpen(conn) { return !!(conn && conn.fast && conn.fast.readyState === 'open'); },
-  sendFast(msg) {
-    if (this.fastOpen(this.conn)) this.conn.fast.send(JSON.stringify(msg));
-    else this.send(msg);
-  },
-  sendFastTo(peer, msg) {
-    const c = this.conns.get(peer);
-    if (this.fastOpen(c)) c.fast.send(JSON.stringify(msg));
-    else if (c && c.open) c.send(msg);
-  },
-  broadcastFast(msg) {
-    let s = null;
-    for (const c of this.conns.values()) {
-      if (this.fastOpen(c)) c.fast.send(s || (s = JSON.stringify(msg)));
-      else if (c.open) c.send(msg);
+  // Envía por el canal rápido de una conexión; si está saturado, descarta (devuelve false).
+  // force: no descartar nunca (ping/pong, para que el ping mostrado sea el real)
+  fastTo(c, msg, str, force = false) {
+    if (this.fastOpen(c)) {
+      if (!force && c.fast.bufferedAmount > this.FAST_MAX_BUFFER) { this.drops++; return false; }
+      c.fast.send(str || JSON.stringify(msg));
+      return true;
     }
+    if (c && c.open && (!c.dataChannel || c.dataChannel.bufferedAmount < this.FAST_MAX_BUFFER * 4)) { c.send(msg); return true; }
+    this.drops++;
+    return false;
+  },
+  sendFast(msg, force) { return this.fastTo(this.conn, msg, null, force); },
+  sendFastTo(peer, msg, force) { return this.fastTo(this.conns.get(peer), msg, null, force); },
+  broadcastFast(msg) {
+    const s = JSON.stringify(msg);
+    for (const c of this.conns.values()) this.fastTo(c, msg, s);
   },
 
   // Ruta de una conexión: directa (P2P) o por un servidor intermedio (relay/TURN)

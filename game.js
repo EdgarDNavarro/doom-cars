@@ -1477,7 +1477,7 @@ function updateLobby() {
 function update(dt) {
   if (state === 'menu') return;
   // Cliente: medir el ping con el host cada segundo
-  if (Net.role === 'client' && (NET.pingT -= dt) <= 0) { NET.pingT = 1; Net.sendFast({ t: 'ping', c: performance.now() }); }
+  if (Net.role === 'client' && (NET.pingT -= dt) <= 0) { NET.pingT = 1; Net.sendFast({ t: 'ping', c: performance.now() }, true); }
   // Cada 2 s: ¿la conexión es directa o pasa por un servidor intermedio (relay)?
   if (Net.role !== 'local' && (NET.routeT -= dt) <= 0) { NET.routeT = 2; checkRoutes(); }
   if (state === 'lobby') { updateLobby(); return; }
@@ -1782,40 +1782,81 @@ function sendLobby() {
   });
 }
 
-// full: incluye puertas y cuerdas (cambian poco). Los carros van en todos.
+// Mensajes de estado compactos: solo lo que tiene valor, números redondeados (los campos que
+// no se mandan se entienden como "nada"/0). Lo que cambia poco va solo en los completos.
+const r2 = (v) => Math.round(v * 100) / 100;
+function packAir(a) {
+  const p = { mo: a.mode, zo: a.zone, tp: a.top, bt: a.bot, z: r2(a.z), t: r2(a.t) };
+  if (a.glideT) p.g = r2(a.glideT);
+  if (a.mode === 'launch') { p.fy = Math.round(a.fromY); p.ty = Math.round(a.toY); p.fz = r2(a.fromZ); }
+  if (a.missed) p.ms = 1;
+  return p;
+}
+function unpackAir(p) {
+  return {
+    mode: p.mo, zone: p.zo, top: p.tp, bot: p.bt, z: p.z, t: p.t, glideT: p.g || 0,
+    fromY: p.fy, toY: p.ty, fromZ: p.fz, missed: !!p.ms,
+  };
+}
+function packCar(c, full) {
+  const s = { id: c.id, x: Math.round(c.x), y: Math.round(c.y), a: r2(c.a), vx: Math.round(c.vx), vy: Math.round(c.vy) };
+  if (!c.alive) s.al = 0;
+  if (c.falling) { s.fa = 1; s.ft = r2(c.fallT); }
+  if (c.thr) s.th = c.thr;
+  if (c.air) s.air = packAir(c.air);
+  if (c.parryCd > 0) s.cd = r2(c.parryCd);
+  if (c.zap) s.zp = { t: r1(c.zap.t), side: c.zap.side };
+  if (c.drift) s.dr = { t: r2(c.drift.t), dir: c.drift.dir, lv: c.drift.lv };
+  if (Math.abs(c.slip) > 0.01) s.sl = r2(c.slip);
+  if (c.noEngine) s.ne = 1;
+  if (c.ghost > 0) s.gh = r1(c.ghost);
+  if (c.combo) s.cb = { pts: Math.round(c.combo.pts), mult: c.combo.mult, idle: r1(c.combo.idle) };
+  if (full) { s.di = Math.round(c.dist); s.dt = r1(c.deathTime); s.sc = c.score; if (c.reason) s.re = c.reason; }
+  return s;
+}
+// full: además puertas, cuerdas, piezas y datos de marcador (cambian poco)
 function makeSnap(full) {
   const snap = {
-    t: 's', seq: ++NET.seq, st: state, cd: countdown, ot: overT, seed: G.seed, time: G.time, pc: G.partCount,
-    doomY: r1(G.doomY), ds: G.doomSpeed, best: G.best, tm: G.team, tb: G.turbo,
-    cars: G.cars.map((c) => ({
-      id: c.id, x: r1(c.x), y: r1(c.y), a: Math.round(c.a * 1000) / 1000, vx: r1(c.vx), vy: r1(c.vy),
-      al: c.alive, fa: c.falling, ft: c.fallT, th: c.thr, di: c.dist, dt: c.deathTime, re: c.reason, air: c.air, cd: c.parryCd,
-      zp: c.zap ? { t: r1(c.zap.t), side: c.zap.side } : null,
-      dr: c.drift, sl: Math.round(c.slip * 100) / 100, sc: c.score, ne: c.noEngine, gh: r1(c.ghost || 0),
-      cb: c.combo ? { pts: Math.round(c.combo.pts), mult: c.combo.mult, idle: r1(c.combo.idle) } : null,
-    })),
+    t: 's', seq: ++NET.seq, st: state, seed: G.seed, time: r2(G.time),
+    doomY: Math.round(G.doomY), ds: Math.round(G.doomSpeed), best: Math.round(G.best),
+    cars: G.cars.map((c) => packCar(c, full)),
   };
+  if (state === 'countdown') snap.cd = r2(countdown);
+  if (state === 'over') snap.ot = r2(overT);
+  if (G.team) snap.tm = r2(G.team);
+  if (G.turbo) snap.tb = r2(G.turbo);
+  if (G.partCount) snap.pc = G.partCount;
   if (full) {
-    snap.gates = [...G.gates.values()].map((g) => ({
-      k: g.k, state: g.state, lanes: g.lanes, progress: g.progress, lockT: g.lockT, openT: g.openT,
-      offs: g.offs, flash: g.flash,
-    }));
-    snap.cg = G.curGate ? G.curGate.k : null;
+    snap.gates = [...G.gates.values()].map((g) => {
+      const s = { k: g.k, state: g.state };
+      if (g.lanes.length) { s.lanes = g.lanes.map((l) => ({ id: l.id, on: l.on ? 1 : 0 })); s.offs = g.offs; }
+      if (g.progress) s.progress = r2(g.progress);
+      if (g.lockT > 0) s.lockT = r2(g.lockT);
+      if (g.state === 'open') s.openT = r2(g.openT);
+      if (g.flash > 0) s.flash = r2(g.flash);
+      return s;
+    });
+    if (G.curGate) snap.cg = G.curGate.k;
     snap.pl = G.parts;
     snap.th = G.tethers.map((t) => ({
-      kind: t.kind, a: t.a, b: t.b, time: r1(t.time), L: r1(t.L), rest: t.rest, max: t.max, k: t.k,
-      slack: t.slack, goalY: t.goalY, snag: t.snag ? { x: t.snag.x, y: t.snag.y } : null,
+      kind: t.kind, a: t.a, b: t.b, time: r1(t.time), L: Math.round(t.L), rest: t.rest, max: t.max, k: t.k,
+      slack: t.slack ? 1 : 0, goalY: t.goalY != null ? Math.round(t.goalY) : null, snag: t.snag ? { x: t.snag.x, y: t.snag.y } : null,
     }));
   }
   return snap;
 }
 
-// Cada fotograma: posiciones por el canal rápido (60/s; puertas y cuerdas cada 4 fotogramas).
+// Posiciones por el canal rápido SNAP_RATE veces por segundo (por tiempo, no por fotograma:
+// una pantalla de 144 Hz no manda más); puertas, cuerdas y marcador cada 4 envíos.
 // Los efectos (sonidos, mensajes, parry…) por el canal fiable, porque no se pueden perder.
-function netHostTick() {
+const SNAP_RATE = 30;
+function netHostTick(dt) {
   if (!Net.conns.size) { NET.queue = []; return; }
-  Net.broadcastFast(makeSnap(NET.frame++ % 4 === 0));
   if (NET.queue.length) { Net.broadcast({ t: 'ev', ev: NET.queue }); NET.queue = []; }
+  NET.sendT -= dt;
+  if (NET.sendT > 0) return;
+  NET.sendT = Math.max(0, NET.sendT + 1 / SNAP_RATE);
+  Net.broadcastFast(makeSnap(NET.frame++ % 4 === 0));
 }
 
 const findNet = (peer, lid) => players.find((p) => p.src.type === 'net' && p.src.peer === peer && p.src.idx === lid);
@@ -1828,7 +1869,7 @@ function hostMessage(m, from) {
     const p = findNet(from, lid);
     if (p) leavePlayer(p);
   } else if (m.t === 'ping') {
-    Net.sendFastTo(from, { t: 'pong', c: m.c });
+    Net.sendFastTo(from, { t: 'pong', c: m.c }, true);
   } else if (m.t === 'in') {
     // Por el canal rápido pueden llegar desordenados: se ignora uno más viejo que el último
     if (typeof m.seq === 'number') {
@@ -1875,7 +1916,7 @@ function applySnap(m) {
     makeWorld(m.seed);
     G.camY = (m.cars.reduce((s, c) => s + c.y, 0) / Math.max(1, m.cars.length)) - 50;
   }
-  state = m.st; countdown = m.cd; overT = m.ot;
+  state = m.st; countdown = m.cd || 0; overT = m.ot || 0;
   G.time = m.time; G.doomY = m.doomY; G.doomSpeed = m.ds; G.best = m.best;
   G.team = m.tm || 0; G.turbo = m.tb || 0;
   G.partCount = m.pc || 0;
@@ -1884,11 +1925,14 @@ function applySnap(m) {
   for (const s of m.cars) {
     let c = carById(s.id);
     if (!c) { c = makeCar(s.id, s.x, s.y); c.a = s.a; G.cars.push(c); }
+    // Lo que no viene en el mensaje compacto es "nada"/0
     Object.assign(c, {
-      alive: s.al, falling: s.fa, fallT: s.ft, thr: s.th, dist: s.di, deathTime: s.dt, reason: s.re, air: s.air, parryCd: s.cd, zap: s.zp,
-      combo: s.cb, score: s.sc || 0, noEngine: !!s.ne, ghost: s.gh || 0,
+      alive: s.al !== 0, falling: !!s.fa, fallT: s.ft || 0, thr: s.th || 0,
+      air: s.air ? unpackAir(s.air) : null, parryCd: s.cd || 0, zap: s.zp || null,
+      combo: s.cb || null, noEngine: !!s.ne, ghost: s.gh || 0,
       tx: s.x, ty: s.y, ta: s.a, tvx: s.vx, tvy: s.vy, recv: now,
     });
+    if (s.di !== undefined) Object.assign(c, { dist: s.di, deathTime: s.dt, score: s.sc || 0, reason: s.re || '' });
     // Mi carro en el suelo lo mueve la predicción local. Lo que manda el host refleja mis
     // teclas de hace un ping, así que se compara con dónde estaba mi carro entonces.
     // Despegué en mi PC: mientras el host no lo confirme, se mantiene mi vuelo local;
@@ -1936,11 +1980,20 @@ function applySnap(m) {
     }
     c.hist = null; c.corr = null;
     if (Math.hypot(s.x - c.x, s.y - c.y) > 250) { c.x = s.x; c.y = s.y; c.a = s.a; }
-    Object.assign(c, { drift: s.dr, slip: s.sl || 0, vx: s.vx, vy: s.vy });
+    Object.assign(c, { drift: s.dr || null, slip: s.sl || 0, vx: s.vx, vy: s.vy });
   }
   if (m.gates) { // puertas y cuerdas vienen solo en los mensajes completos
     const seen = new Set();
-    for (const s of m.gates) { Object.assign(getGate(s.k), s); seen.add(s.k); }
+    for (const s of m.gates) {
+      const g = getGate(s.k);
+      Object.assign(g, {
+        state: s.state, progress: s.progress || 0, lockT: s.lockT || 0, openT: s.openT || 0, flash: s.flash || 0,
+        offs: s.offs || null,
+        // El color y el nombre de cada carril salen del jugador (no hace falta mandarlos)
+        lanes: (s.lanes || []).map((l) => ({ id: l.id, on: !!l.on, color: COLORS[l.id].c, name: 'P' + (l.id + 1) })),
+      });
+      seen.add(s.k);
+    }
     for (const k of [...G.gates.keys()]) if (!seen.has(k)) G.gates.delete(k);
     G.curGate = m.cg != null ? G.gates.get(m.cg) || null : null;
     G.tethers = m.th || [];
@@ -2132,6 +2185,9 @@ async function checkRoutes() {
     try { routes[id] = await Net.route(c); } catch (e) { routes[id] = null; }
   }
   NET.routes = routes;
+  // ¿Se están descartando mensajes por conexión saturada? (cada 2 s)
+  NET.saturated = Net.drops - (NET.lastDrops || 0) > 6;
+  NET.lastDrops = Net.drops;
   updateNetInfo();
 }
 // "directo" o "vía relay (servidor)"; en el host, un resumen de todos los PC conectados
@@ -2148,8 +2204,9 @@ function updateNetInfo() {
   const who = Net.role === 'host' ? `${Net.conns.size} PC conectados`
     : `ping ${NET.rtt ? Math.round(NET.rtt * 1000) + ' ms' : '…'}`;
   const route = routeText();
-  $('netInfo').textContent = `${players.length}/4 jugadores · ${who}${route ? ' · ' + route : ''}`;
-  $('netInfo').style.color = /relay/.test(route) ? '#ffd23f' : '';
+  const sat = NET.saturated ? (Net.role === 'host' ? ' · ⚠ tu subida va saturada' : ' · ⚠ conexión saturada') : '';
+  $('netInfo').textContent = `${players.length}/4 jugadores · ${who}${route ? ' · ' + route : ''}${sat}`;
+  $('netInfo').style.color = NET.saturated ? '#ff8a6a' : /relay/.test(route) ? '#ffd23f' : '';
 }
 function joinRoom(code) {
   code = code.trim().toUpperCase();
